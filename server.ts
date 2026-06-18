@@ -14,8 +14,15 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const isCjs = typeof module !== "undefined" && !!module.exports;
+
+const resolvedFilename = isCjs
+  ? (typeof __filename !== "undefined" ? __filename : "")
+  : fileURLToPath(import.meta.url);
+
+const resolvedDirname = isCjs
+  ? (typeof __dirname !== "undefined" ? __dirname : "")
+  : path.dirname(resolvedFilename);
 
 const app = express();
 app.use(express.json());
@@ -931,7 +938,7 @@ You must return EXACTLY a JSON matches the requested schema below:
 
 // Configure Full Stack Development Middlewares vs. Static production builds
 async function startServer() {
-  const PORT = 3000;
+  const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
   if (process.env.NODE_ENV !== "production") {
     console.log("Starting full-stack development mode with Vite programmatic middlewares...");
@@ -953,7 +960,7 @@ async function startServer() {
       }
 
       try {
-        let template = fs.readFileSync(path.resolve(__dirname, "index.html"), "utf-8");
+        let template = fs.readFileSync(path.resolve(resolvedDirname, "index.html"), "utf-8");
         template = await vite.transformIndexHtml(url, template);
         res.status(200).set({ "Content-Type": "text/html" }).end(template);
       } catch (e) {
@@ -965,7 +972,7 @@ async function startServer() {
   } else {
     console.log("Starting production mode. Serving precompiled static assets...");
     
-    const distPath = path.resolve(__dirname, "dist");
+    const distPath = path.resolve(resolvedDirname);
     
     // Serve static files from compiled dist folder
     app.use(express.static(distPath));
