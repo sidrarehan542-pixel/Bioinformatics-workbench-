@@ -1,0 +1,74 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidUser(data, userId) {
+      return data.keys().hasAll(['id', 'email', 'createdAt'])
+        && data.keys().size() == 3
+        && data.id == userId
+        && data.email is string
+        && data.createdAt is string;
+    }
+
+    function isValidPipeline(data) {
+      return data.keys().hasAll(['id', 'name', 'date', 'queries', 'dbType', 'alignmentConfig'])
+        && data.keys().size() == 6
+        && data.id is string
+        && data.name is string
+        && data.name.size() > 0 && data.name.size() <= 200
+        && data.date is string
+        && data.queries is list
+        && data.queries.size() <= 50
+        && data.dbType is string
+        && data.alignmentConfig is map;
+    }
+
+    function isValidQueryHistoryItem(data) {
+      return data.keys().hasAll(['id', 'name', 'organism', 'sequence', 'sequenceLength', 'databaseSource', 'timestamp'])
+        && data.keys().size() == 7
+        && data.id is string
+        && data.name is string
+        && data.organism is string
+        && data.sequence is string
+        && data.sequenceLength is int
+        && data.databaseSource is string
+        && data.timestamp is string;
+    }
+
+    // Match users
+    match /users/{userId} {
+      allow get, list: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidId(userId) && isValidUser(request.resource.data, userId);
+      allow update: if isOwner(userId) && isValidId(userId) && isValidUser(request.resource.data, userId);
+      allow delete: if isOwner(userId);
+
+      // Pipelines subcollection
+      match /pipelines/{pipelineId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(pipelineId) && isValidPipeline(request.resource.data);
+        allow update: if isOwner(userId) && isValidId(pipelineId) && isValidPipeline(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+
+      // Query History subcollection
+      match /queryHistory/{queryId} {
+        allow get, list: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidId(queryId) && isValidQueryHistoryItem(request.resource.data);
+        allow update: if isOwner(userId) && isValidId(queryId) && isValidQueryHistoryItem(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}

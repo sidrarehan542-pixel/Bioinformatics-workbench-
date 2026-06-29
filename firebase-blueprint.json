@@ -1,0 +1,59 @@
+{
+  "entities": {
+    "user": {
+      "title": "User",
+      "description": "User account detail",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string" },
+        "displayName": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["id", "email", "createdAt"]
+    },
+    "pipeline": {
+      "title": "Pipeline",
+      "description": "Saved analysis pipeline configuration",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "date": { "type": "string" },
+        "queries": { "type": "array" },
+        "dbType": { "type": "string" },
+        "alignmentConfig": { "type": "object" }
+      },
+      "required": ["id", "name", "date", "queries", "dbType", "alignmentConfig"]
+    },
+    "queryHistoryItem": {
+      "title": "QueryHistoryItem",
+      "description": "A protein query saved to search history",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "organism": { "type": "string" },
+        "sequence": { "type": "string" },
+        "sequenceLength": { "type": "integer" },
+        "databaseSource": { "type": "string" },
+        "timestamp": { "type": "string" }
+      },
+      "required": ["id", "name", "organism", "sequence", "sequenceLength", "databaseSource", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "user",
+      "description": "Individual user accounts"
+    },
+    "/users/{userId}/pipelines/{pipelineId}": {
+      "schema": "pipeline",
+      "description": "Saved pipelines for the user"
+    },
+    "/users/{userId}/queryHistory/{queryId}": {
+      "schema": "queryHistoryItem",
+      "description": "Saved query history items for the user"
+    }
+  }
+}

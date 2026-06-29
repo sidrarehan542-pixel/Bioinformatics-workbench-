@@ -303,8 +303,8 @@ export default function StructureViewer({
       setPanX((prev) => prev + dx * panFactor * 3);
       setPanY((prev) => prev + dy * panFactor * 3);
     } else {
-      setRotationY((prev) => prev + dx * 0.007);
-      setRotationX((prev) => prev + dy * 0.007);
+      setRotationY((prev) => prev + dx * 0.015);
+      setRotationX((prev) => prev + dy * 0.015);
     }
     setDragStart({ x: e.clientX, y: e.clientY });
   };
@@ -346,8 +346,8 @@ export default function StructureViewer({
         setPanX((prev) => prev + dx * panFactor * 3);
         setPanY((prev) => prev + dy * panFactor * 3);
       } else {
-        setRotationY((prev) => prev + dx * 0.007);
-        setRotationX((prev) => prev + dy * 0.007);
+        setRotationY((prev) => prev + dx * 0.015);
+        setRotationX((prev) => prev + dy * 0.015);
       }
       setTouchStart({ x: e.touches[0].clientX, y: e.touches[0].clientY });
     } else if (e.touches.length === 2 && touchStartDist !== null) {
@@ -436,28 +436,49 @@ export default function StructureViewer({
     };
   }, [processedAtoms]);
 
-  // Calculate standard center relative bounding box
-  const renderBounds = useMemo(() => {
-    if (processedAtoms.length === 0) return { minX: -20, maxX: 20, minY: -20, maxY: 20 };
-    let minX = Infinity, maxX = -Infinity;
-    let minY = Infinity, maxY = -Infinity;
-
-    for (const at of processedAtoms) {
-      if (at.projX < minX) minX = at.projX;
-      if (at.projX > maxX) maxX = at.projX;
-      if (at.projY < minY) minY = at.projY;
-      if (at.projY > maxY) maxY = at.projY;
+  // Calculate stable, unrotated center and max radius of the atoms list
+  const stableBounds = useMemo(() => {
+    if (atomsList.length === 0) {
+      return { radius: 20 };
     }
+    let sumX = 0, sumY = 0, sumZ = 0;
+    for (const at of atomsList) {
+      sumX += at.x;
+      sumY += at.y;
+      sumZ += at.z;
+    }
+    const avgX = sumX / atomsList.length;
+    const avgY = sumY / atomsList.length;
+    const avgZ = sumZ / atomsList.length;
 
-    const maxSide = Math.max(Math.abs(minX), Math.abs(maxX), Math.abs(minY), Math.abs(maxY));
-    const pad = maxSide * 0.15 + 4;
+    let maxDistSq = 0;
+    for (const at of atomsList) {
+      const dx = at.x - avgX;
+      const dy = at.y - avgY;
+      const dz = at.z - avgZ;
+      const distSq = dx * dx + dy * dy + dz * dz;
+      if (distSq > maxDistSq) {
+        maxDistSq = distSq;
+      }
+    }
+    const radius = Math.sqrt(maxDistSq);
     return {
-      minX: -maxSide - pad,
-      maxX: maxSide + pad,
-      minY: -maxSide - pad,
-      maxY: maxSide + pad,
+      radius: Math.max(radius, 5)
     };
-  }, [processedAtoms]);
+  }, [atomsList]);
+
+  // Calculate standard center relative bounding box (stable & independent of rotation)
+  const renderBounds = useMemo(() => {
+    const radius = stableBounds.radius;
+    const pad = radius * 0.15 + 6;
+    const maxSide = radius + pad;
+    return {
+      minX: -maxSide,
+      maxX: maxSide,
+      minY: -maxSide,
+      maxY: maxSide,
+    };
+  }, [stableBounds]);
 
   // Analyze/detect secondary structure motifs (Alpha-helices vs Beta-sheets vs Loops) dynamically via 3D carbon distances and Chou-Fasman propensity fallback
   const secondaryStructureMap = useMemo(() => {

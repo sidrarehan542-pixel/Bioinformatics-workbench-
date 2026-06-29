@@ -32,13 +32,15 @@ import {
   Network,
   Zap,
   ChevronDown,
-  Briefcase,
-  DollarSign
+  Thermometer,
+  Wrench
 } from "lucide-react";
 import {
   ResponsiveContainer,
   LineChart,
   Line,
+  AreaChart,
+  Area,
   XAxis,
   YAxis,
   Tooltip,
@@ -58,7 +60,8 @@ import {
   calculateHydropathyProfile,
   calculateAminoAcidFrequency,
   performSequenceAlignment,
-  findMotifs
+  findMotifs,
+  computeNetChargeAtPH
 } from "./lib/alignment";
 import { EXAMPLES } from "./data/examples";
 import ChatBox from "./components/ChatBox";
@@ -66,7 +69,13 @@ import StructureViewer from "./components/StructureViewer";
 import { SequenceMap } from "./components/SequenceMap";
 import { BatchProcessor } from "./components/BatchProcessor";
 import { ActiveSitePredictor } from "./components/ActiveSitePredictor";
-import { CommercialServicesHub } from "./components/CommercialServicesHub";
+import { BioinformaticsToolbox } from "./components/BioinformaticsToolbox";
+import { useBioWorker } from "./hooks/useBioWorker";
+import { collection, getDocs, doc, setDoc, deleteDoc, query, orderBy } from "firebase/firestore";
+import { User as FirebaseUser } from "firebase/auth";
+import { db, testConnection } from "./lib/firebase";
+import { UserAuth } from "./components/UserAuth";
+
 
 // Amino Acid mutation simulator properties lookup
 const RESIDUE_MASSES: Record<string, number> = {
@@ -217,6 +226,106 @@ const generateFallbackHelix = (sequence: string): SeedAtom[] => {
 };
 
 export default function App() {
+  const { alignSeqAsync, computePhysAsync, workerSupported } = useBioWorker();
+
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+
+  // Connection test on boot
+  useEffect(() => {
+    testConnection();
+  }, []);
+
+  // Listen to user and fetch records from Firestore
+  useEffect(() => {
+    if (!user) {
+      // If user logs out, reset to the default preset state
+      setSavedPipelines([
+        {
+          id: "pipe-1",
+          name: "Spike Homology Test",
+          date: "2026-06-17",
+          queries: ["P0DTC2", "P0DTC3"],
+          dbType: "uniprot",
+          alignmentConfig: { alignmentType: "global", matchScore: 2, mismatchPenalty: -1, gapPenalty: -2 }
+        },
+        {
+          id: "pipe-2",
+          name: "Insulin Sub-receptor Scan",
+          date: "2026-06-16",
+          queries: ["P01308"],
+          dbType: "uniprot",
+          alignmentConfig: { alignmentType: "local", matchScore: 3, mismatchPenalty: -2, gapPenalty: -3 }
+        }
+      ]);
+      setSearchHistory([]);
+      return;
+    }
+
+    const loadUserData = async () => {
+      try {
+        // Fetch saved pipelines
+        const pipelinesSnap = await getDocs(collection(db, "users", user.uid, "pipelines"));
+        const pipes = pipelinesSnap.docs.map(doc => doc.data() as SavedPipeline);
+        if (pipes.length > 0) {
+          setSavedPipelines(pipes);
+        } else {
+          setSavedPipelines([]);
+        }
+
+        // Fetch query history ordered by timestamp
+        const historySnap = await getDocs(
+          query(collection(db, "users", user.uid, "queryHistory"), orderBy("timestamp", "desc"))
+        );
+        const history = historySnap.docs.map(doc => {
+          const d = doc.data();
+          return {
+            id: d.id,
+            name: d.name,
+            organism: d.organism,
+            sequence: d.sequence,
+            sequenceLength: d.sequenceLength,
+            databaseSource: d.databaseSource as DBType
+          } as ProteinData;
+        });
+        setSearchHistory(history);
+      } catch (err) {
+        console.error("Error loading user data from Firestore:", err);
+      }
+    };
+
+    loadUserData();
+  }, [user]);
+
+  const syncSearchHistoryItem = async (proteinData: ProteinData) => {
+    if (!user) return;
+    try {
+      await setDoc(doc(db, "users", user.uid, "queryHistory", proteinData.id), {
+        id: proteinData.id,
+        name: proteinData.name || "",
+        organism: proteinData.organism || "",
+        sequence: proteinData.sequence || "",
+        sequenceLength: proteinData.sequenceLength || 0,
+        databaseSource: proteinData.databaseSource || "uniprot",
+        timestamp: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error("Failed to sync search history to Cloud Vault:", err);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    setSearchHistory([]);
+    if (user) {
+      try {
+        const historySnap = await getDocs(collection(db, "users", user.uid, "queryHistory"));
+        const batchPromises = historySnap.docs.map(doc => deleteDoc(doc.ref));
+        await Promise.all(batchPromises);
+      } catch (err) {
+        console.error("Failed to clear cloud search history:", err);
+      }
+    }
+  };
+
   // Core workbench states
   const [activeMode, setActiveMode] = useState<UserMode>("professional");
   const [activeDb, setActiveDb] = useState<DBType>("omni");
@@ -247,9 +356,61 @@ export default function App() {
     gapPenalty: -2,
   });
   const [alignmentResult, setAlignmentResult] = useState<AlignmentResult | null>(null);
+  const [isAligning, setIsAligning] = useState<boolean>(false);
+
+  // Physicochemical async states
+  const [physProps, setPhysProps] = useState({ 
+    mw: 0, 
+    pi: 7.0, 
+    length: 0,
+    aliphaticIndex: 0,
+    stabilizingResiduesPct: 0,
+    estimatedTm: 37.0,
+    thermalStatus: "Standard (Mesophilic)",
+    counts: { A: 0, V: 0, I: 0, L: 0, Y: 0, W: 0, R: 0, E: 0 }
+  });
+  const [physPropsChargeData, setPhysPropsChargeData] = useState<Array<{ pH: number; charge: number }>>([]);
+  const [physChartTab, setPhysChartTab] = useState<"titration" | "thermal" | "ph_stability">("titration");
+  const [isPhysComputing, setIsPhysComputing] = useState<boolean>(false);
+
+  // Memoized protein thermal denaturation folding fraction curve
+  const thermalDenaturationData = useMemo(() => {
+    const Tm = physProps.estimatedTm || 37.0;
+    const data = [];
+    for (let temp = 0; temp <= 100; temp += 2) {
+      // Sigmoid transition: F_f = 100 / (1 + exp((temp - Tm) / 3.5))
+      const ff = 100 / (1 + Math.exp((temp - Tm) / 3.5));
+      data.push({
+        temperature: temp,
+        fractionFolded: parseFloat(ff.toFixed(1)),
+        fractionUnfolded: parseFloat((100 - ff).toFixed(1))
+      });
+    }
+    return data;
+  }, [physProps.estimatedTm]);
+
+  // Memoized pH stability profile
+  const phStabilityData = useMemo(() => {
+    const data = [];
+    // Model optimal pH peak around pH 7.2 (cytosolic optimal)
+    for (let pHVal = 2.0; pHVal <= 12.0; pHVal += 0.5) {
+      const dist = pHVal - 7.2;
+      const stab = Math.max(0, 100 - 4.2 * dist * dist);
+      data.push({
+        pH: parseFloat(pHVal.toFixed(1)),
+        stability: parseFloat(stab.toFixed(1))
+      });
+    }
+    return data;
+  }, []);
+
+  // API Abort Controller Refs
+  const querySearchAbortControllerRef = useRef<AbortController | null>(null);
+  const spatialCoordsAbortControllerRef = useRef<AbortController | null>(null);
+  const geminiExplainAbortControllerRef = useRef<AbortController | null>(null);
 
   // Highlight index/tab on center stage
-  const [centerTab, setCenterTab] = useState<"structure" | "physicochemical" | "bioprofiles" | "alignment" | "knowledge" | "services">("structure");
+  const [centerTab, setCenterTab] = useState<"structure" | "physicochemical" | "bioprofiles" | "alignment" | "knowledge" | "toolkit">("structure");
 
   // Mutation Simulator States
   const [mutatePos, setMutatePos] = useState<number>(1);
@@ -319,6 +480,7 @@ export default function App() {
       const filtered = prev.filter(item => item.id !== EXAMPLES[id].id);
       return [EXAMPLES[id], ...filtered].slice(0, 15);
     });
+    syncSearchHistoryItem(EXAMPLES[id]);
     setCustomSequence(EXAMPLES[id].sequence);
     setAlignSeqA(EXAMPLES[id].sequence.slice(0, 100)); // Initialize alignments
     setAlignSeqB(EXAMPLES[id].sequence.slice(10, 110));
@@ -335,13 +497,20 @@ export default function App() {
       return;
     }
 
+    // Cancel in-flight query searches to avoid state race-conditions
+    if (querySearchAbortControllerRef.current) {
+      querySearchAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    querySearchAbortControllerRef.current = controller;
+
     setLoading(true);
     setErrorText("");
     setGeminiExplanation(null);
 
     try {
       const url = `/api/query?db=${dbTerm}&id=${encodeURIComponent(queryTerm)}`;
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: controller.signal });
       
       if (!res.ok) {
         const errJson = await res.json();
@@ -354,12 +523,12 @@ export default function App() {
         const filtered = prev.filter(item => item.id !== proteinData.id);
         return [proteinData, ...filtered].slice(0, 15);
       });
+      syncSearchHistoryItem(proteinData);
       setCustomSequence(proteinData.sequence);
       
       // Update quick alignment candidates
       setAlignSeqA(proteinData.sequence);
       if (proteinData.sequence.length > 30) {
-        // slightly mutate or slice for demo local alignment
         setAlignSeqB(proteinData.sequence.slice(5, Math.min(250, proteinData.sequence.length)));
       } else {
         setAlignSeqB(proteinData.sequence);
@@ -367,17 +536,14 @@ export default function App() {
 
       // Automatically pull spatial coordinates if PDB is parsed or associated
       if (proteinData.pdbCode) {
-        fetchSpatialCoordinates(proteinData.pdbCode);
+        fetchSpatialCoordinates(proteinData.pdbCode, proteinData.sequence);
       } else {
-        // Generate mock structural ribbon coordinates
         const seedAtoms = generateFallbackHelix(proteinData.sequence);
         setAtomsList(seedAtoms);
       }
 
       // Auto-switch tabs based on target DB
-      if (dbTerm === "omni") {
-        setCenterTab("knowledge");
-      } else if (dbTerm === "uniprot" || dbTerm === "kegg") {
+      if (dbTerm === "omni" || dbTerm === "uniprot" || dbTerm === "kegg") {
         setCenterTab("knowledge");
       } else {
         setCenterTab("structure");
@@ -388,10 +554,13 @@ export default function App() {
       setShowChatBox(true);
 
     } catch (e: any) {
+      if (e.name === "AbortError") return; // Ignored aborted fetch
       console.error(e);
       setErrorText(e.message || "Endpoint connection failed. Review your connectivity.");
     } finally {
-      setLoading(false);
+      if (querySearchAbortControllerRef.current === controller) {
+        setLoading(false);
+      }
     }
   };
 
@@ -402,6 +571,7 @@ export default function App() {
       const filtered = prev.filter(item => item.id !== proteinData.id);
       return [proteinData, ...filtered].slice(0, 15);
     });
+    syncSearchHistoryItem(proteinData);
     setCustomSequence(proteinData.sequence);
     
     // Update quick alignment candidates
@@ -413,7 +583,7 @@ export default function App() {
     }
 
     if (proteinData.pdbCode) {
-      fetchSpatialCoordinates(proteinData.pdbCode);
+      fetchSpatialCoordinates(proteinData.pdbCode, proteinData.sequence);
     } else {
       setAtomsList(generateFallbackHelix(proteinData.sequence));
     }
@@ -432,11 +602,17 @@ export default function App() {
   };
 
   // Pull structure vectors
-  const fetchSpatialCoordinates = async (pdbId: string) => {
+  const fetchSpatialCoordinates = async (pdbId: string, fallbackSequence: string = "MAGDSEA") => {
+    if (spatialCoordsAbortControllerRef.current) {
+      spatialCoordsAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    spatialCoordsAbortControllerRef.current = controller;
+
     setAtomsLoading(true);
     try {
       const pId = pdbId.trim().toUpperCase();
-      const res = await fetch(`/api/pdb/spatial?id=${pId}`);
+      const res = await fetch(`/api/pdb/spatial?id=${pId}`, { signal: controller.signal });
       if (!res.ok) {
         throw new Error("Spatial trace not available");
       }
@@ -444,32 +620,45 @@ export default function App() {
       if (data.atoms && data.atoms.length > 0) {
         setAtomsList(data.atoms);
       } else {
-        setAtomsList(generateFallbackHelix(activeRecord.sequence));
+        setAtomsList(generateFallbackHelix(fallbackSequence));
       }
-    } catch (e) {
+    } catch (e: any) {
+      if (e.name === "AbortError") return; // Ignored aborted fetch
       console.warn("Using mathematical dynamic helix fallback, offline or missing PDB coordinates.", e);
-      setAtomsList(generateFallbackHelix(activeRecord.sequence));
+      setAtomsList(generateFallbackHelix(fallbackSequence));
     } finally {
-      setAtomsLoading(false);
+      if (spatialCoordsAbortControllerRef.current === controller) {
+        setAtomsLoading(false);
+      }
     }
   };
 
   // Trigger Gemini explain
   const triggerGeminiExplain = async (record: ProteinData, mode: UserMode) => {
+    if (geminiExplainAbortControllerRef.current) {
+      geminiExplainAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    geminiExplainAbortControllerRef.current = controller;
+
     setGeminiLoading(true);
     try {
       const res = await fetch("/api/explain", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ blockData: record, mode }),
+        signal: controller.signal,
       });
       if (!res.ok) throw new Error("Explain module unresponsive");
       const explanation = await res.json();
       setGeminiExplanation(explanation);
-    } catch (err) {
+    } catch (err: any) {
+      if (err.name === "AbortError") return; // Ignored aborted fetch
       console.error("Gemini failed.", err);
     } finally {
-      setGeminiLoading(false);
+      if (geminiExplainAbortControllerRef.current === controller) {
+        setGeminiLoading(false);
+      }
     }
   };
 
@@ -490,16 +679,55 @@ export default function App() {
     }
   }, [activeMode]);
 
-  // Physicochemical computations on loaded protein sequence
-  const physProps = useMemo(() => {
-    const seq = customSequence || activeRecord?.sequence || "";
-    if (!seq) return { mw: 0, pi: 7.0, length: 0 };
-    return {
-      mw: calculateMolecularWeight(seq),
-      pi: calculateIsoelectricPoint(seq),
-      length: seq.length,
+  // Cleanup in-flight requests on unmount
+  useEffect(() => {
+    return () => {
+      querySearchAbortControllerRef.current?.abort();
+      spatialCoordsAbortControllerRef.current?.abort();
+      geminiExplainAbortControllerRef.current?.abort();
     };
-  }, [customSequence, activeRecord]);
+  }, []);
+
+  // Physicochemical computations on loaded protein sequence (Asynchronous Web Worker with race-condition check)
+  useEffect(() => {
+    let active = true;
+    const seq = customSequence || activeRecord?.sequence || "";
+    if (!seq) {
+      setPhysProps({ 
+        mw: 0, 
+        pi: 7.0, 
+        length: 0,
+        aliphaticIndex: 0,
+        stabilizingResiduesPct: 0,
+        estimatedTm: 37.0,
+        thermalStatus: "Standard (Mesophilic)",
+        counts: { A: 0, V: 0, I: 0, L: 0, Y: 0, W: 0, R: 0, E: 0 }
+      });
+      setPhysPropsChargeData([]);
+      return;
+    }
+
+    setIsPhysComputing(true);
+    computePhysAsync(seq)
+      .then(res => {
+        if (active) {
+          setPhysProps(res.physProps);
+          setPhysPropsChargeData(res.chargePoints);
+        }
+      })
+      .catch(err => {
+        console.error("Failed to compute physical properties via worker:", err);
+      })
+      .finally(() => {
+        if (active) {
+          setIsPhysComputing(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [customSequence, activeRecord, computePhysAsync]);
 
   // Motif prediction results
   const foundSeqMotifs = useMemo(() => {
@@ -531,17 +759,37 @@ export default function App() {
     }));
   }, [customSequence, activeRecord, activeMode]);
 
-  // Execute sequence alignment pipeline
-  const runSequenceAlignment = () => {
-    if (!alignSeqA || !alignSeqB) return;
-    const result = performSequenceAlignment(alignSeqA, alignSeqB, alignConfig);
-    setAlignmentResult(result);
-  };
-
-  // Trigger alignment on load sequence
+  // Execute sequence alignment pipeline asynchronously via Web Worker
   useEffect(() => {
-    runSequenceAlignment();
-  }, [alignSeqA, alignSeqB, alignConfig]);
+    let active = true;
+    if (!alignSeqA || !alignSeqB) return;
+
+    setIsAligning(true);
+    alignSeqAsync(
+      alignSeqA,
+      alignSeqB,
+      alignConfig,
+      activeRecord?.id || "Seq A",
+      "Sequence Target"
+    )
+      .then(result => {
+        if (active) {
+          setAlignmentResult(result);
+        }
+      })
+      .catch(err => {
+        console.error("Alignment pipeline failed via worker:", err);
+      })
+      .finally(() => {
+        if (active) {
+          setIsAligning(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [alignSeqA, alignSeqB, alignConfig, alignSeqAsync, activeRecord]);
 
   // Mouse drag handles for the 3D projection rendering
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -660,7 +908,7 @@ export default function App() {
   };
 
   // Save Pipeline locally for Custom Pipeline panel
-  const handleSavePipeline = () => {
+  const handleSavePipeline = async () => {
     if (!pipelineName.trim()) return;
     const newPipeline: SavedPipeline = {
       id: "pipe-" + Date.now(),
@@ -670,13 +918,29 @@ export default function App() {
       dbType: activeDb,
       alignmentConfig: alignConfig
     };
-    setSavedPipelines([newPipeline, ...savedPipelines]);
+    setSavedPipelines(prev => [newPipeline, ...prev]);
     setPipelineName("");
+
+    if (user) {
+      try {
+        await setDoc(doc(db, "users", user.uid, "pipelines", newPipeline.id), newPipeline);
+      } catch (err) {
+        console.error("Failed to save pipeline to Cloud Vault:", err);
+      }
+    }
   };
 
   // Delete Pipeline
-  const handleDeletePipeline = (id: string) => {
-    setSavedPipelines(savedPipelines.filter(p => p.id !== id));
+  const handleDeletePipeline = async (id: string) => {
+    setSavedPipelines(prev => prev.filter(p => p.id !== id));
+
+    if (user) {
+      try {
+        await deleteDoc(doc(db, "users", user.uid, "pipelines", id));
+      } catch (err) {
+        console.error("Failed to delete pipeline from Cloud Vault:", err);
+      }
+    }
   };
 
   // Load a saved pipeline query configuration
@@ -826,6 +1090,242 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // Advanced Export 4: Physicochemical and Stability Dossier
+  const handleDownloadPhysicochemicalDossier = () => {
+    const seq = customSequence || activeRecord?.sequence || "";
+    if (!seq) return;
+
+    let content = `========================================================================\n`;
+    content += `        BIOHELIX PROTEIN PHYSICOCHEMICAL & THERMAL STABILITY DOSSIER\n`;
+    content += `========================================================================\n\n`;
+    content += `ORGANISM / SYMBOL NAME:  ${activeRecord?.name || "Query target"}\n`;
+    content += `ACCESSION CODE:          ${activeRecord?.id || "N/A"}\n`;
+    content += `EXTRACTED SEQUENCE LEN:  ${physProps.length} Amino Acids\n`;
+    content += `GENERATED DOSSIER DATE:  ${new Date().toLocaleString()}\n`;
+    content += `------------------------------------------------------------------------\n\n`;
+
+    content += `PART 1: CORE MOLECULAR CONSTANTS\n`;
+    content += `---------------------------------\n`;
+    content += `Molecular Weight:        ${(physProps.mw / 1000).toFixed(4)} kDa (${physProps.mw.toLocaleString()} Daltons)\n`;
+    content += `Isoelectric Point (pI):  pH ${physProps.pi}\n`;
+    content += `Charge at Neutral pH:    ${computeNetChargeAtPH(seq, 7.0).toFixed(2)} e\n\n`;
+
+    content += `PART 2: THERMAL STABILITY ANALYSIS\n`;
+    content += `-----------------------------------\n`;
+    content += `Thermal Stability Index: ${physProps.aliphaticIndex} (Aliphatic Packing Ratio)\n`;
+    content += `Thermostable Residues %: ${physProps.stabilizingResiduesPct}% (IVYWREL custom set)\n`;
+    content += `Estimated Melting (Tm):  ~${physProps.estimatedTm}°C\n`;
+    content += `Stability Classification: ${physProps.thermalStatus}\n\n`;
+
+    content += `PART 3: STABILITY-CRITICAL AMINO ACID STOCKS\n`;
+    content += `----------------------------------------------\n`;
+    content += `Alanine (Ala/A):         ${physProps.counts.A} (${((physProps.counts.A / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Valine (Val/V):          ${physProps.counts.V} (${((physProps.counts.V / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Isoleucine (Ile/I):      ${physProps.counts.I} (${((physProps.counts.I / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Leucine (Leu/L):         ${physProps.counts.L} (${((physProps.counts.L / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Tyrosine (Tyr/Y):        ${physProps.counts.Y} (${((physProps.counts.Y / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Tryptophan (Trp/W):      ${physProps.counts.W} (${((physProps.counts.W / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Arginine (Arg/R):        ${physProps.counts.R} (${((physProps.counts.R / seq.length) * 100).toFixed(1)}%)\n`;
+    content += `Glutamate (Glu/E):       ${physProps.counts.E} (${((physProps.counts.E / seq.length) * 100).toFixed(1)}%)\n\n`;
+
+    content += `PART 4: TITRATION CHARGE CHARTING\n`;
+    content += `---------------------------------\n`;
+    content += `pH Rating   | Estimated Net Charge\n`;
+    content += `------------+---------------------\n`;
+    const titrationPoints = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+    titrationPoints.forEach(pH => {
+      const charge = computeNetChargeAtPH(seq, pH);
+      content += `pH ${pH.toString().padEnd(8)} | ${charge.toFixed(2).padStart(15)} e\n`;
+    });
+    content += `\n`;
+    content += `========================================================================\n`;
+    content += `END OF PHYSICOCHEMICAL DOSSIER EXPORT - SYSTEM OPERATING IN FREE TIER\n`;
+    content += `========================================================================\n`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeRecord?.id || "physico"}_stability_dossier.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Advanced Export 5: Bioprofiles (frequencies and Kyte-Doolittle)
+  const handleDownloadBioprofilesData = () => {
+    const seq = customSequence || activeRecord?.sequence || "";
+    if (!seq) return;
+
+    let content = `========================================================================\n`;
+    content += `         BIOHELIX PROTEIN RESIDUE FREQUENCY & HYDROPATHY DATASET\n`;
+    content += `========================================================================\n\n`;
+    content += `ORGANISM / SYMBOL NAME:  ${activeRecord?.name || "Query target"}\n`;
+    content += `ACCESSION CODE:          ${activeRecord?.id || "N/A"}\n`;
+    content += `EXTRACTED SEQUENCE LEN:  ${seq.length} Amino Acids\n`;
+    content += `GENERATED DATE:          ${new Date().toLocaleString()}\n`;
+    content += `------------------------------------------------------------------------\n\n`;
+
+    content += `PART 1: AMINO ACID PERCENT DISTRIBUTION\n`;
+    content += `----------------------------------------\n`;
+    content += `Residue | Count | Percentage\n`;
+    content += `--------+-------+------------\n`;
+    aaDistribution.forEach(entry => {
+      content += `${entry.name.padEnd(7)} | ${entry.count.toString().padEnd(5)} | ${entry.percentage.toFixed(2)}%\n`;
+    });
+    content += `\n`;
+
+    content += `PART 2: SLIDING-WINDOW KYTE-DOOLITTLE HYDROPATHY INDEX\n`;
+    content += `--------------------------------------------------------\n`;
+    content += `Residue Index | Hydropathy Score\n`;
+    content += `--------------+-----------------\n`;
+    hydropathyProfileData.forEach(entry => {
+      content += `${entry.index.toString().padEnd(13)} | ${entry.score.toFixed(3)}\n`;
+    });
+    content += `\n`;
+    content += `========================================================================\n`;
+    content += `END OF BIOPROFILES DATASET EXPORT\n`;
+    content += `========================================================================\n`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeRecord?.id || "bioprofiles"}_residue_hydropathy_dataset.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Advanced Export 6: Target intelligent deep profile explanation reports
+  const handleDownloadKnowledgeExplanation = () => {
+    if (!geminiExplanation) return;
+    
+    let content = `========================================================================\n`;
+    content += `        BIOHELIX TARGET INTELLIGENT DEEP PROFILE INFERENCES\n`;
+    content += `========================================================================\n\n`;
+    content += `ORGANISM / SYMBOL NAME:  ${activeRecord?.name || "Query target"}\n`;
+    content += `ACCESSION CODE:          ${activeRecord?.id || "N/A"}\n`;
+    content += `GENERATION DATE:         ${new Date().toLocaleString()}\n`;
+    content += `------------------------------------------------------------------------\n\n`;
+
+    content += `SUMMARY OVERVIEW:\n`;
+    content += `-----------------\n`;
+    content += `${geminiExplanation.summary}\n\n`;
+
+    content += `STRUCTURAL FOLD CONSTRAINTS:\n`;
+    content += `----------------------------\n`;
+    content += `${geminiExplanation.structureNote || "N/A"}\n\n`;
+
+    content += `THERAPEUTIC RELEVANCE & IMPORTANCE:\n`;
+    content += `-----------------------------------\n`;
+    content += `${geminiExplanation.therapeuticNote || "N/A"}\n\n`;
+
+    if (geminiExplanation.relatedPathways && geminiExplanation.relatedPathways.length > 0) {
+      content += `RELATED BIOLOGICAL PATHWAYS:\n`;
+      content += `----------------------------\n`;
+      geminiExplanation.relatedPathways.forEach((pw, i) => {
+        content += `${i + 1}. ${pw}\n`;
+      });
+      content += `\n`;
+    }
+
+    if (geminiExplanation.interactingReceptors && geminiExplanation.interactingReceptors.length > 0) {
+      content += `INTERACTING RECEPTORS & PARTNERS:\n`;
+      content += `---------------------------------\n`;
+      geminiExplanation.interactingReceptors.forEach((rec, i) => {
+        content += `${i + 1}. ${rec}\n`;
+      });
+      content += `\n`;
+    }
+
+    content += `========================================================================\n`;
+    content += `END OF INTELLIGENT DEEP PROFILE REPORT\n`;
+    content += `========================================================================\n`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeRecord?.id || "deep"}_profile_report.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // Advanced Export 7: Mutation Simulation Prediction Reports
+  const handleDownloadMutationReport = (
+    pos: number,
+    originalValue: string,
+    targetValue: string,
+    origDetails: any,
+    targetDetails: any,
+    origWeight: number,
+    targetWeight: number,
+    blosumScore: number,
+    warnings: string[]
+  ) => {
+    let content = `========================================================================\n`;
+    content += `         BIOHELIX SINGLE RESIDUE MUTATION PREDICTION REPORT\n`;
+    content += `========================================================================\n\n`;
+    content += `ORGANISM / SYMBOL NAME:  ${activeRecord?.name || "Query target"}\n`;
+    content += `ACCESSION CODE:          ${activeRecord?.id || "N/A"}\n`;
+    content += `SIMULATION DATE:         ${new Date().toLocaleString()}\n`;
+    content += `MUTATION TYPE:           Single Amino-Acid Variant (SAV / SNV)\n`;
+    content += `------------------------------------------------------------------------\n\n`;
+
+    content += `PART 1: INDEL / SUBSTITUTION TARGETING\n`;
+    content += `---------------------------------------\n`;
+    content += `Residue Position:        Coordinate Index ${pos} (1-indexed)\n`;
+    content += `Original Residue:        ${originalValue} (${origDetails.name})\n`;
+    content += `Substitution Target:     ${targetValue} (${targetDetails.name})\n`;
+    content += `Conservation Score:      BLOSUM62 Value: ${blosumScore}\n\n`;
+
+    content += `PART 2: PHYSICOCHEMICAL SHIFT PROFILE (DELTAS)\n`;
+    content += `----------------------------------------------\n`;
+    content += `Property             | Original            | Target              | Delta Shift\n`;
+    content += `---------------------+---------------------+---------------------+---------------------\n`;
+    
+    const weightDelta = targetWeight - origWeight;
+    content += `Weight (Da)          | ${origWeight.toFixed(2).padEnd(19)} | ${targetWeight.toFixed(2).padEnd(19)} | ${(weightDelta >= 0 ? "+" : "") + weightDelta.toFixed(2)} Da\n`;
+    
+    const chgDelta = targetDetails.charge - origDetails.charge;
+    content += `Charge (e)           | ${origDetails.charge.toFixed(2).padEnd(19)} | ${targetDetails.charge.toFixed(2).padEnd(19)} | ${(chgDelta >= 0 ? "+" : "") + chgDelta.toFixed(2)} e\n`;
+    
+    const hydroDelta = targetDetails.hydropathy - origDetails.hydropathy;
+    content += `Hydropathy Index     | ${origDetails.hydropathy.toFixed(2).padEnd(19)} | ${targetDetails.hydropathy.toFixed(2).padEnd(19)} | ${(hydroDelta >= 0 ? "+" : "") + hydroDelta.toFixed(2)}\n`;
+    
+    content += `Class Category       | ${origDetails.class.padEnd(19)} | ${targetDetails.class.padEnd(19)} | Shift to ${targetDetails.class}\n\n`;
+
+    content += `PART 3: BIOPHYSICAL & STRUCTURAL CONSEQUENCE INFERENCES\n`;
+    content += `--------------------------------------------------------\n`;
+    if (warnings.length > 0) {
+      warnings.forEach((warning, idx) => {
+        content += `${idx + 1}. [DETECTION] ${warning}\n`;
+      });
+    } else {
+      content += `No major conformation breaking or salt bridge collapse risks detected for this substitution. Conformation is predicted to remain stable.\n`;
+    }
+    content += `\n`;
+
+    content += `========================================================================\n`;
+    content += `END OF BIOLOGICAL PREDICTIVE IN-SILICO MUTATION LOGS\n`;
+    content += `========================================================================\n`;
+
+    const blob = new Blob([content], { type: "text/plain;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${activeRecord?.id || "predicted"}_mutation_${originalValue}${pos}${targetValue}_report.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   // File Upload parser for sequence input
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -873,6 +1373,22 @@ export default function App() {
     reader.readAsText(file);
   };
 
+  // Loads a custom analyzed sequence from Bioinformatics Toolbox into the primary workspace
+  const handleLoadCustomSequence = (seq: string, name: string = "Custom Result") => {
+    setCustomSequence("");
+    setActiveRecord({
+      id: "TOOLBOX_RESULT",
+      name: name,
+      organism: "Synthesized / Optimized Sequence",
+      sequence: seq,
+      sequenceLength: seq.length,
+      description: "Calculated result imported directly from the Bioinformatics Toolbox.",
+      functionText: "Polypeptide or nucleotide sequence block loaded into the workspace for secondary structure and physicochemical profiling.",
+      databaseSource: "uniprot",
+      externalUrl: ""
+    });
+  };
+
   return (
     <div id="root-workbench" className="flex flex-col min-h-screen lg:h-screen w-full bg-slate-950 text-slate-200 font-sans overflow-y-auto lg:overflow-hidden">
       
@@ -898,99 +1414,7 @@ export default function App() {
             </div>
           </div>
           
-          {/* Mobile User Avatar */}
-          <div className="lg:hidden flex items-center gap-2">
-             <div className="relative">
-              <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700 text-xs font-bold text-indigo-400 shadow-md">
-                SR
-              </div>
-              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-emerald-500 border-2 border-slate-900 rounded-full"></span>
-            </div>
-          </div>
-        </div>
-
-        {/* Centralised Smart Middleware Query Module with AI Chat Companion drop-down */}
-        <div className="flex flex-1 w-full lg:max-w-2xl lg:mx-8 relative flex-col justify-center">
-          <div className="flex w-full items-center bg-slate-800 border border-slate-750 rounded-lg p-1 group focus-within:ring-2 focus-within:ring-emerald-500 focus-within:border-transparent transition-all relative z-10">
-            
-            {/* Target Select Database */}
-            <select
-              value={activeDb}
-              onChange={(e) => setActiveDb(e.target.value as DBType)}
-              className="bg-slate-900 border-none text-xs rounded-md text-blue-400 font-bold px-3 py-1.5 focus:outline-none cursor-pointer"
-            >
-              <option value="omni">Global Federated Search</option>
-              <option value="uniprot">UniProt</option>
-              <option value="pdb">PDB Structure</option>
-              <option value="ncbi">NCBI Nucleotide</option>
-              <option value="alphafold">AlphaFold DB</option>
-              <option value="pubchem">PubChem</option>
-              <option value="kegg">KEGG Pathway</option>
-            </select>
-
-            <div className="h-4 w-[1px] bg-slate-700 mx-2"></div>
-
-            {/* Central input */}
-            <div className="relative flex-1">
-              <span className="absolute inset-y-0 left-2.5 flex items-center text-slate-500 pointer-events-none">
-                <Search className="w-4 h-4" />
-              </span>
-              <input
-                id="search-input-field"
-                type="text"
-                value={searchQuery}
-                onKeyDown={handleQueryKeydown}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full bg-transparent border-none py-1.5 pl-9 pr-4 text-xs text-slate-200 font-mono placeholder:text-slate-500 focus:outline-none"
-                placeholder={
-                  activeDb === "uniprot" 
-                    ? "Enter UniProt Accession (e.g., P01308, P42212, P0DTC2)..."
-                    : activeDb === "pdb"
-                    ? "Enter PDB Code (e.g., 6VXX, 1TRZ, 1EMA, 6M0J)..."
-                    : activeDb === "alphafold"
-                    ? "Enter UniProt ID for structure prediction (e.g., Q8WUR8, O15533)..."
-                    : activeDb === "pubchem"
-                    ? "Enter Drug/Compound name or CID (e.g., Aspirin, Caffeine, 2244)..."
-                    : activeDb === "kegg"
-                    ? "Enter Pathway Map ID (e.g., map00010, map00020)..."
-                    : "Enter Accession or keyword (e.g., NM_000526, Spike, Insulin)..."
-                }
-              />
-            </div>
-
-            <button
-              onClick={() => handleQuerySearch()}
-              disabled={loading}
-              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white rounded-md text-xs font-bold transition-all flex items-center gap-1.5 disabled:opacity-50"
-            >
-              {loading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-              Fetch
-            </button>
-
-            <button
-              onClick={() => setShowChatBox(!showChatBox)}
-              className={`ml-1 px-3 py-1.5 rounded-md text-xs font-bold transition-colors flex items-center gap-1.5 shrink-0 ${
-                showChatBox 
-                  ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/20" 
-                  : "bg-slate-700 hover:bg-slate-650 text-slate-200 hover:text-white"
-              }`}
-              title="Toggle Gemini Companion Chat Bar"
-            >
-              <Sparkles className={`w-3.5 h-3.5 ${showChatBox ? "animate-pulse" : "text-emerald-400"}`} />
-              <span className="hidden sm:inline">Ask AI</span>
-            </button>
-          </div>
-
-          <ChatBox 
-            activeRecord={activeRecord} 
-            isOpen={showChatBox} 
-            onClose={() => setShowChatBox(false)} 
-          />
-
-          <BatchProcessor 
-            activeDb={activeDb}
-            onLoadRecord={handleLoadFetchedRecord}
-          />
+          
         </div>
 
         {/* Dual Mode Switcher & Account Meta */}
@@ -1024,22 +1448,119 @@ export default function App() {
             </button>
           </div>
 
-          {/* User badge */}
-          <div className="hidden lg:flex items-center gap-2">
-            <div className="relative">
-              <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center border border-slate-700 text-xs font-bold text-emerald-400 shadow-md">
-                SR
-              </div>
-              <span className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-emerald-500 border-2 border-slate-900 rounded-full"></span>
-            </div>
-            <div className="hidden xl:flex flex-col text-[11px]">
-              <span className="font-bold text-slate-300 leading-tight">Biotech Analyst</span>
-              <span className="text-[9px] text-slate-500 font-mono">sidrarehan@axis</span>
-            </div>
-          </div>
+          {/* Secure Cloud-Synced Authentication Unit */}
+          <UserAuth 
+            onUserChanged={setUser}
+            savedPipelinesCount={savedPipelines.length}
+            queryHistoryCount={searchHistory.length}
+          />
         </div>
 
       </header>
+
+      {/* Individual high-contrast, premium, dedicated search panel */}
+      <div className="bg-slate-900/60 border-b border-slate-800 px-4 py-4 md:px-6 shrink-0 relative z-40 shadow-lg">
+        <div className="max-w-7xl mx-auto flex flex-col lg:flex-row items-stretch lg:items-center gap-3">
+          
+          {/* Label / Database Select */}
+          <div className="flex items-center justify-between lg:justify-start gap-2.5 shrink-0 lg:border-r lg:border-slate-850 lg:pr-4">
+            <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1.5 min-w-[70px]">
+              <Database className="w-4 h-4 text-emerald-400 shrink-0" />
+              Source DB
+            </span>
+            <select
+              value={activeDb}
+              onChange={(e) => setActiveDb(e.target.value as DBType)}
+              className="bg-slate-950 border border-slate-850 text-xs rounded-xl text-emerald-300 font-bold px-3 py-2.5 focus:ring-2 focus:ring-emerald-500 focus:outline-none cursor-pointer hover:bg-slate-900 transition-colors shadow-sm"
+              title="Biological Database Scope Selector"
+              id="db-scope-selector"
+            >
+              <option value="omni">Global Federated Search</option>
+              <option value="uniprot">UniProt Knowledge Base</option>
+              <option value="pdb">PDB Structural Data</option>
+              <option value="ncbi">NCBI Nucleotide</option>
+              <option value="alphafold font-bold">AlphaFold DB Model</option>
+              <option value="pubchem text-orange-400">PubChem Chemical Compound</option>
+              <option value="kegg">KEGG Pathway Map</option>
+            </select>
+          </div>
+
+          {/* Large High-Contrast Dedicated Individual Search Box Field */}
+          <div className="flex-1 min-w-0 relative group">
+            <span className="absolute inset-y-0 left-3.5 flex items-center text-slate-400 pointer-events-none group-focus-within:text-emerald-400 transition-colors">
+              <Search className="w-5 h-5" />
+            </span>
+            <input
+              id="search-input-field"
+              type="text"
+              value={searchQuery}
+              onKeyDown={handleQueryKeydown}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full bg-slate-950 border border-slate-805 hover:border-slate-700 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 rounded-xl py-3 pl-11 pr-10 text-sm font-semibold font-mono text-white placeholder:text-slate-500 focus:outline-none transition-all shadow-inner shadow-black/40"
+              placeholder={
+                activeDb === "uniprot" 
+                  ? "Enter UniProt Accession (e.g., P01308, P42212, P0DTC2)..."
+                  : activeDb === "pdb"
+                  ? "Enter PDB Code (e.g., 6VXX, 1TRZ, 1EMA, 6M0J)..."
+                  : activeDb === "alphafold"
+                  ? "Enter UniProt ID for structure prediction (e.g., Q8WUR8, O15533)..."
+                  : activeDb === "pubchem"
+                  ? "Enter Drug/Compound name or CID (e.g., Aspirin, Caffeine, 2244)..."
+                  : activeDb === "kegg"
+                  ? "Enter Pathway Map ID (e.g., map00010, map00020)..."
+                  : "Enter Accession or keyword (e.g., NM_000526, Spike, Insulin)..."
+              }
+            />
+            {searchQuery && (
+              <button 
+                onClick={() => setSearchQuery("")} 
+                className="absolute right-3.5 inset-y-0 flex items-center text-slate-400 hover:text-white text-xs font-bold transition-colors"
+                title="Clear input"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+
+          {/* Action Buttons */}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => handleQuerySearch()}
+              disabled={loading}
+              className="px-5 py-3 bg-blue-600 hover:bg-blue-500 text-white rounded-xl text-xs font-bold transition-all flex items-center gap-2 disabled:opacity-50 select-none shadow-md shadow-blue-900/20 active:scale-95"
+            >
+              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4 text-blue-200" />}
+              Fetch Record
+            </button>
+
+            <button
+              onClick={() => setShowChatBox(!showChatBox)}
+              className={`px-4 py-3 rounded-xl text-xs font-bold transition-all flex items-center gap-2 shrink-0 select-none active:scale-95 border ${
+                showChatBox 
+                  ? "bg-emerald-600 hover:bg-emerald-500 text-white border-emerald-500 shadow-md shadow-emerald-950/20" 
+                  : "bg-slate-800 hover:bg-slate-750 text-slate-200 hover:text-white border-slate-705"
+              }`}
+              title="Toggle Gemini Companion Chat Bar"
+            >
+              <Sparkles className={`w-4 h-4 ${showChatBox ? "animate-pulse" : "text-emerald-400"}`} />
+              <span>Ask AI Chat</span>
+            </button>
+          </div>
+
+          {/* Embedded Dropdown Widgets */}
+          <ChatBox 
+            activeRecord={activeRecord} 
+            isOpen={showChatBox} 
+            onClose={() => setShowChatBox(false)} 
+          />
+
+          <BatchProcessor 
+            activeDb={activeDb}
+            onLoadRecord={handleLoadFetchedRecord}
+          />
+
+        </div>
+      </div>
 
 
       {/* Main Workbench Body Area Layout */}
@@ -1056,7 +1577,16 @@ export default function App() {
                   <History className="w-3.5 h-3.5" />
                   Search History
                 </span>
-                <span className="text-[9px] font-mono text-emerald-500/70">{searchHistory.length} queries</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-[9px] font-mono text-emerald-500/70">{searchHistory.length} queries</span>
+                  <button 
+                    onClick={handleClearHistory}
+                    className="text-[9px] hover:text-rose-400 text-slate-500 font-bold transition-all cursor-pointer border border-slate-800 hover:border-rose-500/30 px-1.5 py-0.5 rounded bg-slate-950/40"
+                    title="Clear Search History"
+                  >
+                    Clear
+                  </button>
+                </div>
               </div>
               <div className="grid grid-cols-1 gap-2 max-h-[14rem] overflow-y-auto pr-1">
                 {searchHistory.map((item, idx) => {
@@ -1266,7 +1796,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setCenterTab("structure");
-                        fetchSpatialCoordinates(activeRecord.pdbCode!);
+                        fetchSpatialCoordinates(activeRecord.pdbCode!, activeRecord.sequence);
                       }}
                       className="text-[10px] text-blue-400 hover:text-blue-300 underline font-semibold"
                     >
@@ -1485,22 +2015,32 @@ export default function App() {
               </button>
 
               <button
-                onClick={() => setCenterTab("services")}
-                className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 border border-emerald-500/10 ${
-                  centerTab === "services"
-                    ? "bg-emerald-950/40 text-emerald-300 border border-emerald-500/30"
-                    : "text-slate-400 hover:text-emerald-300/85 hover:bg-emerald-950/20"
+                onClick={() => setCenterTab("toolkit")}
+                className={`px-4 py-2 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 ${
+                  centerTab === "toolkit"
+                    ? "bg-slate-950 text-indigo-400 border border-slate-800"
+                    : "text-slate-400 hover:text-slate-200"
                 }`}
               >
-                <Briefcase className="w-4 h-4 shrink-0 text-emerald-400 animate-pulse" />
-                Biotech Consultancy Hub
+                <Wrench className="w-4 h-4 shrink-0 text-indigo-400" />
+                Bioinformatics Toolbox
               </button>
+
             </div>
           </div>
 
           {/* Core Visual Display Section content based on centerTab state */}
           <div className="flex-1 bg-slate-900 border border-slate-800 rounded-xl overflow-hidden flex flex-col min-h-0">
             
+            {/* TAB: Bioinformatics Toolbox */}
+            {centerTab === "toolkit" && (
+              <BioinformaticsToolbox
+                activeRecord={activeRecord}
+                onNavigateTab={(tab) => setCenterTab(tab)}
+                onLoadCustomSequence={handleLoadCustomSequence}
+              />
+            )}
+
             {/* TAB: 3D Structure Interactive Canvas */}
             {centerTab === "structure" && (
               <StructureViewer
@@ -1600,38 +2140,212 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Charges estimation curve across different pH ratings */}
-                <div className="bg-slate-950/40 border border-slate-850 p-4 rounded-xl flex-1 flex flex-col min-h-[250px]">
-                  <h4 className="text-[11px] font-bold text-slate-400 uppercase tracking-widest mb-4">Charge curve mapping at various pH rates</h4>
-                  <div className="h-52 w-full">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart
-                        data={[
-                          { pH: 1, charge: 14.2 },
-                          { pH: 2, charge: 12.5 },
-                          { pH: 3, charge: 9.8 },
-                          { pH: 4, charge: 5.6 },
-                          { pH: 5, charge: 2.1 },
-                          { pH: 6, charge: 0.1 },
-                          { pH: 7, charge: -2.3 },
-                          { pH: 8, charge: -5.4 },
-                          { pH: 9, charge: -10.2 },
-                          { pH: 10, charge: -12.9 },
-                          { pH: 11, charge: -15.1 },
-                          { pH: 12, charge: -16.8 },
-                          { pH: 13, charge: -18.2 },
-                          { pH: 14, charge: -19.5 },
-                        ]}
-                      >
-                        <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
-                        <XAxis dataKey="pH" name="pH" stroke="#64748b" fontSize={10} />
-                        <YAxis name="Charge" stroke="#64748b" fontSize={10} label={{ value: "Net Charge (e)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 10 }} />
-                        <Tooltip contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: 8, fontSize: 11 }} />
-                        <ReferenceLine y={0} stroke="#f43f5e" strokeDasharray="5 5" label={{ value: "Isoelectric point threshold", fill: "#f43f5e", fontSize: 9 }} />
-                        <Line type="monotone" dataKey="charge" stroke="#3b82f6" strokeWidth={2} dot={{ r: 3 }} />
-                      </LineChart>
-                    </ResponsiveContainer>
+                {/* Visual Analysis Matrix (Thermal Stability Index Calculator & Charges Titration Curve Side-by-Side) */}
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                  
+                  {/* Card 1: Thermal Stability Index & Compositional Packing Calculator */}
+                  <div className="bg-slate-950/40 border border-[#1e293b]/80 p-5 rounded-xl flex flex-col justify-between gap-4">
+                    <div className="flex justify-between items-start border-b border-slate-900 pb-3">
+                      <div>
+                        <h4 className="text-[12px] font-black text-slate-100 uppercase tracking-widest flex items-center gap-1.5">
+                          <Thermometer className="w-4 h-4 text-rose-400 shrink-0" />
+                          Thermal Stability & Packing Index
+                        </h4>
+                        <p className="text-[10px] text-slate-400 mt-1">Estimations derived from primary residue hydrophobicity and aliphatic packing volume.</p>
+                      </div>
+                      <span className={`text-[9.5px] font-black px-2.5 py-0.5 rounded border uppercase shrink-0 ${
+                        physProps.aliphaticIndex > 115 
+                          ? "bg-rose-500/10 text-rose-300 border-rose-500/20" 
+                          : physProps.aliphaticIndex > 85 
+                          ? "bg-yellow-500/10 text-yellow-350 border-yellow-500/20"
+                          : physProps.aliphaticIndex < 65
+                          ? "bg-sky-500/10 text-sky-300 border-sky-500/20"
+                          : "bg-emerald-500/10 text-emerald-300 border-emerald-500/30"
+                      }`}>
+                        {physProps.thermalStatus}
+                      </span>
+                    </div>
+
+                    {/* Stability Metric Gauges */}
+                    <div className="grid grid-cols-3 gap-3">
+                      <div className="bg-slate-950/60 border border-slate-900 rounded p-3 text-center flex flex-col justify-between">
+                        <span className="text-[9px] text-slate-500 uppercase font-black block">Aliphatic Index</span>
+                        <span className="text-lg font-black font-mono text-blue-400 block mt-1">{physProps.aliphaticIndex}</span>
+                        <span className="text-[8px] text-slate-400 block mt-0.5">Aliphatic side chain vol %</span>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-slate-900 rounded p-3 text-center flex flex-col justify-between">
+                        <span className="text-[9px] text-slate-500 uppercase font-black block">Est. Melting Point</span>
+                        <span className="text-lg font-black font-mono text-emerald-400 block mt-1">~{physProps.estimatedTm}°C</span>
+                        <span className="text-[8px] text-slate-400 block mt-0.5">Estimated fold native Tm</span>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-slate-900 rounded p-3 text-center flex flex-col justify-between">
+                        <span className="text-[9px] text-slate-500 uppercase font-black block">Stabilizing aa %</span>
+                        <span className="text-lg font-black font-mono text-indigo-400 block mt-1">{physProps.stabilizingResiduesPct}%</span>
+                        <span className="text-[8px] text-slate-400 block mt-0.5">Core IVYWREL frequency</span>
+                      </div>
+                    </div>
+
+                    {/* Compositional Progress Bars */}
+                    <div className="flex flex-col gap-2.5 bg-slate-900/30 p-3.5 border border-slate-900 rounded-lg">
+                      <span className="text-[9px] font-black text-slate-400 uppercase tracking-wider block">Hydrophobic Packing components breakdown</span>
+                      
+                      {/* Ala packing */}
+                      <div className="flex flex-col gap-1">
+                        <div className="flex justify-between items-center text-[10px] text-slate-300">
+                          <span>Alanine (Ala / A) — Packing Core</span>
+                          <span className="font-mono text-blue-400 font-bold">{physProps.counts.A} ({((physProps.counts.A / (physProps.length || 1)) * 100).toFixed(1)}%)</span>
+                        </div>
+                        <div className="w-full bg-slate-950 h-1.5 overflow-hidden rounded">
+                          <div className="bg-blue-500 h-full rounded" style={{ width: `${Math.min(100, (physProps.counts.A / (physProps.length || 1)) * 100)}%` }}></div>
+                        </div>
+                      </div>
+
+                      {/* Val packing */}
+                      <div className="flex flex-col gap-1">
+                        <div className="flex justify-between items-center text-[10px] text-slate-300">
+                          <span>Valine (Val / V) — High-temperature backbone lock</span>
+                          <span className="font-mono text-emerald-400 font-bold">{physProps.counts.V} ({((physProps.counts.V / (physProps.length || 1)) * 100).toFixed(1)}%)</span>
+                        </div>
+                        <div className="w-full bg-slate-950 h-1.5 overflow-hidden rounded">
+                          <div className="bg-emerald-500 h-full rounded" style={{ width: `${Math.min(100, (physProps.counts.V / (physProps.length || 1)) * 100)}%` }}></div>
+                        </div>
+                      </div>
+
+                      {/* Ile / Leu packing */}
+                      <div className="flex flex-col gap-1">
+                        <div className="flex justify-between items-center text-[10px] text-slate-300">
+                          <span>Isoleucine & Leucine (Ile/Leu - I/L) — Bulky Aliphatics</span>
+                          <span className="font-mono text-indigo-400 font-bold">{(physProps.counts.I + physProps.counts.L)} ({(((physProps.counts.I + physProps.counts.L) / (physProps.length || 1)) * 100).toFixed(1)}%)</span>
+                        </div>
+                        <div className="w-full bg-slate-950 h-1.5 overflow-hidden rounded">
+                          <div className="bg-indigo-505 bg-indigo-500 h-full rounded" style={{ width: `${Math.min(100, ((physProps.counts.I + physProps.counts.L) / (physProps.length || 1)) * 100)}%` }}></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* EXPORT DOSSIER BUTTON */}
+                    <button
+                      onClick={handleDownloadPhysicochemicalDossier}
+                      disabled={!physProps.length}
+                      className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-blue-950/40 to-indigo-950/40 hover:from-blue-900/40 hover:to-indigo-900/40 text-[10.5px] font-black tracking-wide uppercase border border-blue-500/20 hover:border-blue-500/45 text-blue-300 rounded-lg py-3 transition-all cursor-pointer shadow-md disabled:opacity-40"
+                    >
+                      <Download className="w-4 h-4 shrink-0" />
+                      Download Full Stability & Titration Report (.TXT)
+                    </button>
                   </div>
+
+                  {/* Card 2: Interactive Stability & Physical Properties Charts */}
+                  <div className="bg-slate-950/40 border border-[#1e293b]/80 p-5 rounded-xl flex flex-col justify-between min-h-[300px]">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-900 pb-3 mb-4 gap-3">
+                      <div>
+                        <h4 className="text-[12px] font-black text-slate-100 uppercase tracking-widest flex items-center gap-1.5">
+                          <Activity className="w-4 h-4 text-blue-400 shrink-0" />
+                          Properties & Stability Analysis
+                        </h4>
+                        <p className="text-[10px] text-slate-400 mt-1">
+                          {physChartTab === "titration" && "Exact net electrical charge dynamics calculated from pH 1.0 to 14.0."}
+                          {physChartTab === "thermal" && `Thermal melting transition curve. Folded fraction decreases sigmoidally around estimated Tm (~${physProps.estimatedTm}°C).`}
+                          {physChartTab === "ph_stability" && "Optimal bell-shaped pH stability profile peaking around physiological neutrality (pH 7.2)."}
+                        </p>
+                      </div>
+
+                      {/* Tab toggles */}
+                      <div className="flex bg-slate-950/90 p-0.5 rounded border border-slate-850 self-start sm:self-center font-sans">
+                        <button
+                          onClick={() => setPhysChartTab("titration")}
+                          className={`px-2 py-1 text-[9px] font-black uppercase rounded tracking-wider cursor-pointer transition-all ${
+                            physChartTab === "titration"
+                              ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                              : "text-slate-500 hover:text-slate-350"
+                          }`}
+                        >
+                          Titration
+                        </button>
+                        <button
+                          onClick={() => setPhysChartTab("thermal")}
+                          className={`px-2 py-1 text-[9px] font-black uppercase rounded tracking-wider cursor-pointer transition-all ${
+                            physChartTab === "thermal"
+                              ? "bg-rose-500/10 text-rose-400 border border-rose-500/20"
+                              : "text-slate-500 hover:text-slate-350"
+                          }`}
+                        >
+                          Thermal
+                        </button>
+                        <button
+                          onClick={() => setPhysChartTab("ph_stability")}
+                          className={`px-2 py-1 text-[9px] font-black uppercase rounded tracking-wider cursor-pointer transition-all ${
+                            physChartTab === "ph_stability"
+                              ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                              : "text-slate-500 hover:text-slate-350"
+                          }`}
+                        >
+                          pH Stability
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="h-56 w-full flex-1">
+                      {physPropsChargeData.length === 0 ? (
+                        <div className="h-full flex items-center justify-center text-xs text-slate-500 italic">No sequence context loaded.</div>
+                      ) : (
+                        <>
+                          {physChartTab === "titration" && (
+                            <ResponsiveContainer width="100%" height="100%">
+                              <LineChart data={physPropsChargeData}>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                <XAxis dataKey="pH" name="pH" stroke="#64748b" fontSize={10} />
+                                <YAxis name="Charge" stroke="#64748b" fontSize={10} label={{ value: "Net Charge (e)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 10 }} />
+                                <Tooltip contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: 8, fontSize: 11 }} />
+                                <ReferenceLine y={0} stroke="#f43f5e" strokeDasharray="5 5" label={{ value: `pI is pH ${physProps.pi}`, fill: "#f43f5e", fontSize: 9 }} />
+                                <Line type="monotone" dataKey="charge" stroke="#3b82f6" strokeWidth={2.5} dot={{ r: 3 }} />
+                              </LineChart>
+                            </ResponsiveContainer>
+                          )}
+
+                          {physChartTab === "thermal" && (
+                            <ResponsiveContainer width="100%" height="100%">
+                              <AreaChart data={thermalDenaturationData}>
+                                <defs>
+                                  <linearGradient id="thermalColor" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.25}/>
+                                    <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                <XAxis dataKey="temperature" name="Temp" stroke="#64748b" fontSize={10} unit="°C" />
+                                <YAxis name="Folded" stroke="#64748b" fontSize={10} unit="%" label={{ value: "Fraction Folded (%)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 10 }} />
+                                <Tooltip contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: 8, fontSize: 11 }} />
+                                <ReferenceLine x={physProps.estimatedTm} stroke="#f59e0b" strokeDasharray="4 4" label={{ value: `Tm: ${physProps.estimatedTm}°C`, fill: "#f59e0b", fontSize: 9, position: "top" }} />
+                                <Area type="monotone" dataKey="fractionFolded" name="Folded %" stroke="#f43f5e" fillOpacity={1} fill="url(#thermalColor)" strokeWidth={2} />
+                              </AreaChart>
+                            </ResponsiveContainer>
+                          )}
+
+                          {physChartTab === "ph_stability" && (
+                            <ResponsiveContainer width="100%" height="100%">
+                              <AreaChart data={phStabilityData}>
+                                <defs>
+                                  <linearGradient id="phColor" x1="0" y1="0" x2="0" y2="1">
+                                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.25}/>
+                                    <stop offset="95%" stopColor="#10b981" stopOpacity={0}/>
+                                  </linearGradient>
+                                </defs>
+                                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                                <XAxis dataKey="pH" name="pH" stroke="#64748b" fontSize={10} />
+                                <YAxis name="Stability" stroke="#64748b" fontSize={10} unit="%" label={{ value: "Relative Stability (%)", angle: -90, position: "insideLeft", fill: "#64748b", fontSize: 10 }} />
+                                <Tooltip contentStyle={{ backgroundColor: "#0f172a", border: "1px solid #334155", borderRadius: 8, fontSize: 11 }} />
+                                <ReferenceLine x={7.2} stroke="#3b82f6" strokeDasharray="4 4" label={{ value: "Optimum pH 7.2", fill: "#3b82f6", fontSize: 9, position: "top" }} />
+                                <Area type="monotone" dataKey="stability" name="Stability %" stroke="#10b981" fillOpacity={1} fill="url(#phColor)" strokeWidth={2} />
+                              </AreaChart>
+                            </ResponsiveContainer>
+                          )}
+                        </>
+                      )}
+                    </div>
+                  </div>
+
                 </div>
 
                 {/* Dynamic Bioinformatics Single-Residue Mutation Simulator (SNV/SAV Calculator) */}
@@ -1947,6 +2661,25 @@ export default function App() {
                           </div>
                         </div>
                       )}
+
+                      {/* Download Mutation Prediction Report Button */}
+                      <button
+                        onClick={() => handleDownloadMutationReport(
+                          safePos,
+                          originalAA,
+                          targetAA,
+                          origDetails,
+                          targetDetails,
+                          origWeight,
+                          targetWeight,
+                          blosum62Score,
+                          structuralWarnings
+                        )}
+                        className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-indigo-950/40 to-slate-900/40 hover:from-indigo-900/40 hover:to-slate-800/40 text-[10.5px] font-black tracking-wide uppercase border border-indigo-500/20 hover:border-indigo-500/45 text-indigo-300 rounded-lg py-2.5 transition-all cursor-pointer shadow-md"
+                      >
+                        <Download className="w-4 h-4 shrink-0" />
+                        Download Mutation Analysis Report (.TXT)
+                      </button>
                     </div>
                   );
                 })()}
@@ -1972,6 +2705,16 @@ export default function App() {
                       Computational prediction of structural indices. Plots hydrophilic regions (crucial for solubility) vs. hydrophobic regions (transmembrane zones).
                     </p>
                   </div>
+                  
+                  {/* Download Bioprofile Button */}
+                  <button
+                    onClick={handleDownloadBioprofilesData}
+                    disabled={!hydropathyProfileData || hydropathyProfileData.length === 0}
+                    className="flex items-center gap-1.5 px-3 py-1.5 border border-emerald-500/20 bg-emerald-950/20 hover:bg-emerald-950/40 text-[10.5px] font-black text-emerald-300 rounded-lg shrink-0 select-none uppercase tracking-wide transition-colors cursor-pointer disabled:opacity-40"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Download Dataset (.TXT)
+                  </button>
                 </div>
 
                 {/* Kyte-Doolittle Window Hydropathy Line Chart */}
@@ -2203,15 +2946,7 @@ export default function App() {
               </div>
             )}
 
-            {/* TAB: B2B Biotech Consultancy Hub & Commercial Services */}
-            {centerTab === "services" && (
-              <CommercialServicesHub
-                activeRecord={activeRecord}
-                atomsList={atomsList}
-                customSequence={customSequence}
-                onSetTab={(tab) => setCenterTab(tab)}
-              />
-            )}
+
 
             {/* TAB: Target Intelligent Deep Profile (Knowledge Graph & Interactions) */}
             {centerTab === "knowledge" && (
@@ -2227,6 +2962,15 @@ export default function App() {
                       AI-generated insights merging pharmaceutical, structural, and pathway systems.
                     </p>
                   </div>
+                  {geminiExplanation && (
+                    <button
+                      onClick={handleDownloadKnowledgeExplanation}
+                      className="flex items-center gap-1.5 px-3 py-1.5 border border-indigo-500/20 bg-indigo-950/20 hover:bg-indigo-950/40 text-[10.5px] font-black text-indigo-300 rounded-lg shrink-0 select-none uppercase tracking-wide transition-colors cursor-pointer"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Download Report (.TXT)
+                    </button>
+                  )}
                 </div>
 
                 {geminiLoading ? (

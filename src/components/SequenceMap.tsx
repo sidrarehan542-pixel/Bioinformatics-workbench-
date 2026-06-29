@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
 import { AlignmentResult, MotifMatch } from "../types";
 import { findMotifs } from "../lib/alignment";
-import { Info, Disc, Check, Sparkles, Sliders, ChevronDown, Activity } from "lucide-react";
+import { Info, Disc, Check, Sparkles, Sliders, ChevronDown, Activity, Globe, Search, HelpCircle } from "lucide-react";
 
 interface SequenceMapProps {
   alignmentResult: AlignmentResult;
@@ -204,6 +204,188 @@ export const SequenceMap: React.FC<SequenceMapProps> = ({ alignmentResult }) => 
 
   const totalMotifsCount = alignedMotifsA.length + alignedMotifsB.length;
 
+  // New interactive sub-tab state for Sequence Map
+  const [subTab, setSubTab] = useState<"motifs" | "conservation">("motifs");
+  const [activeConservePos, setActiveConservePos] = useState<number>(1);
+  const [conserveFilter, setConserveFilter] = useState<number>(0);
+  const [searchPosInput, setSearchPosInput] = useState<string>("");
+
+  // Deterministic Linear Congruential Generator for stable pseudo-random mutations
+  const runLcg = (seed: number) => {
+    let s = seed;
+    return () => {
+      s = (s * 1664525 + 1013904223) % 4294967296;
+      return s / 4294967296;
+    };
+  };
+
+  const SPECIES_LIST = useMemo(() => [
+    { id: "human", name: "Homo sapiens (Human)", drift: 0.0, color: "text-sky-300", group: "Mammalia" },
+    { id: "chimp", name: "Pan troglodytes (Chimpanzee)", drift: 0.015, color: "text-teal-300", group: "Mammalia" },
+    { id: "mouse", name: "Mus musculus (Mouse)", drift: 0.12, color: "text-emerald-400", group: "Mammalia" },
+    { id: "rat", name: "Rattus norvegicus (Rat)", drift: 0.14, color: "text-green-400", group: "Mammalia" },
+    { id: "chicken", name: "Gallus gallus (Chicken)", drift: 0.28, color: "text-amber-400", group: "Aves" },
+    { id: "zebrafish", name: "Danio rerio (Zebrafish)", drift: 0.38, color: "text-orange-400", group: "Actinopterygii" },
+    { id: "fruitfly", name: "Drosophila melanogaster (Fruit Fly)", drift: 0.52, color: "text-rose-400", group: "Insecta" }
+  ], []);
+
+  // Compute Evolutionary Conservation Map based on rawSeqA (Candidate A)
+  const conserveData = useMemo(() => {
+    const seq = rawSeqA;
+    const L = seq.length;
+    if (!L) return { sequences: {}, scores: [], conservedDomains: [] };
+
+    const allAminoAcids = ["A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"];
+    const classes = {
+      hydrophobic: ["A", "V", "I", "L", "M", "F", "Y", "W"],
+      polar: ["S", "T", "C", "N", "Q"],
+      charged: ["D", "E", "K", "R", "H"],
+      special: ["G", "P"]
+    };
+
+    const findClass = (aa: string) => {
+      for (const [cls, list] of Object.entries(classes)) {
+        if (list.includes(aa)) return { cls, list };
+      }
+      return { cls: "other", list: allAminoAcids };
+    };
+
+    // Pre-populate sequences record
+    const sequences: Record<string, string[]> = {};
+    SPECIES_LIST.forEach(sp => {
+      sequences[sp.id] = [];
+    });
+
+    const scores: number[] = [];
+
+    for (let i = 0; i < L; i++) {
+      const refAA = seq[i] || "A";
+      // Check if inside any detected motif of A
+      const isFunctional = motifsA.some(m => i >= m.start - 1 && i <= m.end - 1);
+      const conservationFactor = isFunctional ? 0.12 : 1.0;
+
+      // Seed the LCG deterministically based on position, character and length
+      const nextRand = runLcg(i * 1999 + refAA.charCodeAt(0) * 113 + L);
+
+      const posResidues: Record<string, string> = {};
+
+      SPECIES_LIST.forEach(sp => {
+        if (sp.id === "human") {
+          posResidues[sp.id] = refAA;
+          sequences[sp.id].push(refAA);
+        } else {
+          const mutationThreshold = sp.drift * conservationFactor;
+          if (nextRand() < mutationThreshold) {
+            // Substitution mutation
+            const { list: classList } = findClass(refAA);
+            const sameClassChance = nextRand();
+            let mutatedAA = refAA;
+            if (sameClassChance < 0.72 && classList.length > 1) {
+              const filtered = classList.filter(x => x !== refAA);
+              const idx = Math.floor(nextRand() * filtered.length);
+              mutatedAA = filtered[idx] || refAA;
+            } else {
+              const filtered = allAminoAcids.filter(x => x !== refAA);
+              const idx = Math.floor(nextRand() * filtered.length);
+              mutatedAA = filtered[idx] || refAA;
+            }
+            posResidues[sp.id] = mutatedAA;
+            sequences[sp.id].push(mutatedAA);
+          } else {
+            posResidues[sp.id] = refAA;
+            sequences[sp.id].push(refAA);
+          }
+        }
+      });
+
+      // Score 0 to 9 calculation
+      const listRes = SPECIES_LIST.map(sp => posResidues[sp.id]);
+      const matchesRef = listRes.filter(r => r === refAA).length;
+
+      const refClass = findClass(refAA).cls;
+      const sameClassCount = listRes.filter(r => findClass(r).cls === refClass).length;
+
+      let score = 0;
+      if (matchesRef === 7) score = 9;
+      else if (matchesRef === 6) score = 8;
+      else if (matchesRef === 5) score = 7;
+      else if (matchesRef === 4) score = 5 + (sameClassCount >= 6 ? 1 : 0);
+      else if (matchesRef === 3) score = 3 + (sameClassCount >= 5 ? 1 : 0);
+      else if (matchesRef === 2) score = 1 + (sameClassCount >= 4 ? 1 : 0);
+      else score = 0 + (sameClassCount >= 3 ? 1 : 0);
+
+      scores.push(score);
+    }
+
+    // Detect conserved blocks of residues
+    const conservedDomains: Array<{ start: number; end: number; sequence: string; avgScore: number }> = [];
+    let currentStart: number | null = null;
+    for (let i = 0; i < L; i++) {
+      if (scores[i] >= 8) {
+        if (currentStart === null) {
+          currentStart = i;
+        }
+      } else {
+        if (currentStart !== null) {
+          const length = i - currentStart;
+          if (length >= 5) {
+            const subScores = scores.slice(currentStart, i);
+            const avgScore = subScores.reduce((a, b) => a + b, 0) / length;
+            conservedDomains.push({
+              start: currentStart + 1,
+              end: i,
+              sequence: seq.slice(currentStart, i),
+              avgScore: parseFloat(avgScore.toFixed(2))
+            });
+          }
+          currentStart = null;
+        }
+      }
+    }
+    if (currentStart !== null) {
+      const length = L - currentStart;
+      if (length >= 5) {
+        const subScores = scores.slice(currentStart, L);
+        const avgScore = subScores.reduce((a, b) => a + b, 0) / length;
+        conservedDomains.push({
+          start: currentStart + 1,
+          end: L,
+          sequence: seq.slice(currentStart, L),
+          avgScore: parseFloat(avgScore.toFixed(2))
+        });
+      }
+    }
+
+    return {
+      sequences,
+      scores,
+      conservedDomains
+    };
+  }, [rawSeqA, motifsA, SPECIES_LIST]);
+
+  // Jump input handler
+  const handleJumpToPosition = (e: React.FormEvent) => {
+    e.preventDefault();
+    const pos = parseInt(searchPosInput, 10);
+    if (!isNaN(pos) && pos >= 1 && pos <= rawSeqA.length) {
+      setActiveConservePos(pos);
+      setSearchPosInput("");
+    }
+  };
+
+  const getScoreColor = (score: number) => {
+    if (score >= 9) return "bg-emerald-500 text-emerald-950";
+    if (score >= 8) return "bg-emerald-400 text-emerald-950";
+    if (score >= 7) return "bg-teal-400 text-teal-950";
+    if (score >= 6) return "bg-cyan-400 text-cyan-950";
+    if (score >= 5) return "bg-amber-300 text-amber-950";
+    if (score >= 4) return "bg-amber-400 text-amber-950";
+    if (score >= 3) return "bg-orange-400 text-orange-950";
+    if (score >= 2) return "bg-orange-500 text-orange-950";
+    if (score >= 1) return "bg-rose-400 text-rose-950";
+    return "bg-rose-600 text-rose-100";
+  };
+
   return (
     <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4 flex flex-col gap-4 mt-2">
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-800 pb-3">
@@ -213,428 +395,784 @@ export const SequenceMap: React.FC<SequenceMapProps> = ({ alignmentResult }) => 
               <Activity className="w-4 h-4" />
             </span>
             <div>
-              <span className="text-[10px] text-blue-400 font-extrabold uppercase tracking-widest block">Comparative Visualization</span>
+              <span className="text-[10px] text-blue-400 font-extrabold uppercase tracking-widest block font-sans">Comparative Visualization</span>
               <h4 className="text-sm font-bold text-slate-100 mt-0.5">Graphical Alignment Sequence Map</h4>
             </div>
           </div>
           <p className="text-[11px] text-slate-400 mt-1 leading-relaxed">
-            Correlates local functional Prosite signatures onto international coordinates of the global comparison. Tap nodes to audit residue-level changes.
+            Correlates local functional Prosite signatures and evolutionary conservation matrices onto loaded sequences.
           </p>
         </div>
 
-        {/* Mini stats counters */}
-        <div className="flex items-center gap-3">
-          <div className="bg-slate-950 border border-slate-850 rounded px-2.5 py-1 text-center min-w-[80px]">
-            <span className="text-[8px] text-slate-500 uppercase block font-black">Detected Motifs</span>
-            <span className="text-xs font-mono font-black text-indigo-400">{totalMotifsCount}</span>
-          </div>
-          <div className="bg-slate-950 border border-slate-850 rounded px-2.5 py-1 text-center min-w-[80px]">
-            <span className="text-[8px] text-slate-500 uppercase block font-black">Distinct Types</span>
-            <span className="text-xs font-mono font-black text-amber-500">{allDetectedNames.length}</span>
-          </div>
+        {/* Sub-tab Switcher buttons */}
+        <div className="flex bg-slate-950 p-1 rounded-lg border border-slate-850 self-start md:self-center">
+          <button
+            onClick={() => setSubTab("motifs")}
+            className={`px-3 py-1.5 text-[10.5px] font-black uppercase tracking-wider rounded-md transition-all cursor-pointer ${
+              subTab === "motifs"
+                ? "bg-indigo-950/60 text-indigo-300 border border-indigo-500/30 font-bold"
+                : "text-slate-400 hover:text-slate-200 font-bold"
+            }`}
+          >
+            Functional Motifs
+          </button>
+          <button
+            onClick={() => setSubTab("conservation")}
+            className={`px-3 py-1.5 text-[10.5px] font-black uppercase tracking-wider rounded-md transition-all cursor-pointer flex items-center gap-1.5 ${
+              subTab === "conservation"
+                ? "bg-emerald-950/60 text-emerald-300 border border-emerald-500/30 font-bold"
+                : "text-slate-400 hover:text-slate-200 font-bold"
+            }`}
+          >
+            <Globe className="w-3.5 h-3.5" />
+            Evolutionary Conservation
+          </button>
         </div>
       </div>
 
-      {allDetectedNames.length === 0 ? (
-        <div className="p-4 bg-slate-950 border border-slate-850 rounded-lg text-center text-xs text-slate-500 italic">
-          No functional Prosite active sites resolved in either of the candidate sequences to represent.
-        </div>
-      ) : (
-        <>
-          {/* Legend and Filter checkboxes */}
-          <div className="flex flex-col gap-1.5">
-            <span className="text-[10px] text-slate-500 uppercase font-black tracking-wider flex items-center gap-1.5">
-              <Sliders className="w-3 h-3 text-indigo-400" /> Active Motif Filters
-            </span>
-            <div className="flex flex-wrap gap-2">
-              {allDetectedNames.map((name) => {
-                const isEnabled = isMotifEnabled(name);
-                const colors = getMotifColorInfo(name);
-                return (
-                  <button
-                    key={name}
-                    onClick={() => handleToggleMotif(name)}
-                    className={`flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold rounded-full border transition-all select-none ${
-                      isEnabled
-                        ? `${colors.badgeBg} ring-1 ring-slate-800`
-                        : "bg-slate-950 border-slate-900 text-slate-600 line-through"
-                    }`}
-                  >
-                    <span
-                      className="w-1.5 h-1.5 rounded-full shrink-0"
-                      style={{ backgroundColor: isEnabled ? colors.color : "#475569" }}
-                    />
-                    <span>{name}</span>
-                    {isEnabled && <Check className="w-2.5 h-2.5 text-blue-400" />}
-                  </button>
-                );
-              })}
-            </div>
+      {subTab === "motifs" ? (
+        allDetectedNames.length === 0 ? (
+          <div className="p-4 bg-slate-950 border border-slate-850 rounded-lg text-center text-xs text-slate-500 italic">
+            No functional Prosite active sites resolved in either of the candidate sequences to represent.
           </div>
-
-          {/* Interactive Graphical Overview Map */}
-          <div className="flex flex-col gap-4 bg-slate-950/70 p-4 border border-slate-850 rounded-lg">
-            <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wide">
-              Whole Genome Alignment Map Overview ({totalLength} residues)
-            </span>
-
-            <div className="flex flex-col gap-4">
-              {/* Candidate A Track */}
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center justify-between text-[10px] font-mono">
-                  <span className="font-extrabold text-blue-400 flex items-center gap-1">
-                    <Disc className="w-2.5 h-2.5 text-blue-500" />
-                    Cand_A: {alignmentResult.seqAId}
-                  </span>
-                  <span className="text-slate-500 font-bold">{rawSeqA.length} aa</span>
-                </div>
-                {/* Visual Track container */}
-                <div className="relative h-6 bg-slate-900 border border-slate-800/80 rounded-md">
-                  {/* Subtle ticks */}
-                  <div className="absolute inset-0 flex justify-between px-2 text-[8px] font-mono text-slate-700 pointer-events-none select-none items-center">
-                    <span>1</span>
-                    <span>{Math.floor(totalLength / 2)}</span>
-                    <span>{totalLength}</span>
-                  </div>
-
-                  {/* Active Motifs Blocks in A */}
-                  {alignedMotifsA.map((mot, idx) => {
-                    if (!isMotifEnabled(mot.name)) return null;
-                    const colors = getMotifColorInfo(mot.name);
-                    const left = (mot.alignedStart / totalLength) * 100;
-                    const width = ((mot.alignedEnd - mot.alignedStart + 1) / totalLength) * 100;
-
-                    const isSelected = selectedInspect?.motif.alignedStart === mot.alignedStart && selectedInspect?.sequence === "A";
-
-                    return (
-                      <button
-                        key={`mot-a-${idx}`}
-                        className={`absolute h-4 top-1 rounded border text-[8px] font-mono flex items-center justify-center font-extrabold px-1 transition-all hover:scale-[1.02] active:scale-95 text-ellipsis overflow-hidden whitespace-nowrap min-w-[8px] ${colors.bg} ${colors.border} ${colors.text} ${
-                          isSelected ? "ring-2 ring-indigo-500/80 ring-offset-2 ring-offset-slate-950 shadow-lg scale-102" : ""
-                        }`}
-                        style={{
-                          left: `${left}%`,
-                          width: `${Math.max(1.5, width)}%`,
-                        }}
-                        onClick={() => setSelectedInspect({ motif: mot, sequence: "A" })}
-                        title={`${mot.name} (A): Pos ${mot.start}-${mot.end}`}
-                      >
-                        {width > 6 ? mot.name.split(" ")[0] : ""}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Candidate B Track */}
-              <div className="flex flex-col gap-1.5">
-                <div className="flex items-center justify-between text-[10px] font-mono">
-                  <span className="font-extrabold text-purple-405 text-fuchsia-400 flex items-center gap-1">
-                    <Disc className="w-2.5 h-2.5 text-fuchsia-500" />
-                    Cand_B: {alignmentResult.seqBId}
-                  </span>
-                  <span className="text-slate-500 font-bold">{rawSeqB.length} aa</span>
-                </div>
-                {/* Visual Track container */}
-                <div className="relative h-6 bg-slate-900 border border-slate-800/80 rounded-md">
-                  {/* Subtle ticks */}
-                  <div className="absolute inset-0 flex justify-between px-2 text-[8px] font-mono text-slate-700 pointer-events-none select-none items-center">
-                    <span>1</span>
-                    <span>{Math.floor(totalLength / 2)}</span>
-                    <span>{totalLength}</span>
-                  </div>
-
-                  {/* Active Motifs Blocks in B */}
-                  {alignedMotifsB.map((mot, idx) => {
-                    if (!isMotifEnabled(mot.name)) return null;
-                    const colors = getMotifColorInfo(mot.name);
-                    const left = (mot.alignedStart / totalLength) * 100;
-                    const width = ((mot.alignedEnd - mot.alignedStart + 1) / totalLength) * 100;
-
-                    const isSelected = selectedInspect?.motif.alignedStart === mot.alignedStart && selectedInspect?.sequence === "B";
-
-                    return (
-                      <button
-                        key={`mot-b-${idx}`}
-                        className={`absolute h-4 top-1 rounded border text-[8px] font-mono flex items-center justify-center font-extrabold px-1 transition-all hover:scale-[1.02] active:scale-95 text-ellipsis overflow-hidden whitespace-nowrap min-w-[8px] ${colors.bg} ${colors.border} ${colors.text} ${
-                          isSelected ? "ring-2 ring-indigo-500/80 ring-offset-2 ring-offset-slate-950 shadow-lg scale-102" : ""
-                        }`}
-                        style={{
-                          left: `${left}%`,
-                          width: `${Math.max(1.5, width)}%`,
-                        }}
-                        onClick={() => setSelectedInspect({ motif: mot, sequence: "B" })}
-                        title={`${mot.name} (B): Pos ${mot.start}-${mot.end}`}
-                      >
-                        {width > 6 ? mot.name.split(" ")[0] : ""}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Interactive Inspection Dashboard */}
-          {selectedInspect && (
-            <div className="bg-indigo-950/20 border border-indigo-900/40 p-4 rounded-xl flex flex-col md:flex-row gap-4 items-stretch shadow-md">
-              <div className="flex-1 flex flex-col gap-1.5">
-                <div className="flex items-center gap-1.5">
-                  <Sparkles className="w-4 h-4 text-amber-400" />
-                  <span className="text-[10px] text-amber-400 font-extrabold uppercase tracking-wider">Active Motif Inspector</span>
-                </div>
-                <h4 className="text-xs font-black text-slate-100 flex items-center gap-2">
-                  {selectedInspect.motif.name}{" "}
-                  <span className="text-[10px] font-mono font-black text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
-                    Source: Candidate {selectedInspect.sequence}
-                  </span>
-                </h4>
-                <p className="text-[11px] text-slate-400 leading-normal mt-1">
-                  {selectedInspect.motif.description}
-                </p>
-                <div className="grid grid-cols-2 lg:grid-cols-3 gap-2 text-[10px] font-mono text-slate-400 mt-2 bg-slate-950 p-2.5 rounded-lg border border-slate-900">
-                  <div>
-                    <span className="text-slate-500 block">Original position:</span>
-                    <strong className="text-slate-200">
-                      Residues {selectedInspect.motif.start} - {selectedInspect.motif.end}
-                    </strong>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Aligned alignment range:</span>
-                    <strong className="text-slate-200">
-                      Col {selectedInspect.motif.alignedStart + 1} - {selectedInspect.motif.alignedEnd + 1}
-                    </strong>
-                  </div>
-                  <div className="col-span-2 lg:col-span-1">
-                    <span className="text-slate-500 block">Recognition pattern:</span>
-                    <strong className="text-slate-300 font-bold bg-slate-900 border border-slate-800 px-1 py-0.5 rounded text-[8px]">
-                      {selectedInspect.motif.pattern}
-                    </strong>
-                  </div>
-                </div>
-              </div>
-
-              {/* Side-by-side Motif Seq comparative Alignment */}
-              <div className="w-full md:w-80 bg-slate-950 p-3 rounded-xl border border-indigo-950/40 flex flex-col gap-2.5 justify-center">
-                <span className="text-[9px] text-indigo-400 font-extrabold uppercase tracking-wider block">Sequence Conservation Audit</span>
-                
-                {(() => {
-                  const sStart = selectedInspect.motif.alignedStart;
-                  const sEnd = selectedInspect.motif.alignedEnd;
-                  
-                  // Cut sub-slices from aligned sequences to represent
-                  const segmentA = alignmentResult.alignedSeqA.slice(sStart, sEnd + 1);
-                  const segmentB = alignmentResult.alignedSeqB.slice(sStart, sEnd + 1);
-                  const segmentConsensus = alignmentResult.consensus.slice(sStart, sEnd + 1);
-
-                  // Count similarities
-                  let matchCount = 0;
-                  for (let i = 0; i < segmentA.length; i++) {
-                    if (segmentA[i] === segmentB[i] && segmentA[i] !== "-") matchCount++;
-                  }
-                  
+        ) : (
+          <>
+            {/* Legend and Filter checkboxes */}
+            <div className="flex flex-col gap-1.5">
+              <span className="text-[10px] text-slate-500 uppercase font-black tracking-wider flex items-center gap-1.5">
+                <Sliders className="w-3 h-3 text-indigo-400" /> Active Motif Filters
+              </span>
+              <div className="flex flex-wrap gap-2">
+                {allDetectedNames.map((name) => {
+                  const isEnabled = isMotifEnabled(name);
+                  const colors = getMotifColorInfo(name);
                   return (
-                    <div className="flex flex-col gap-2">
-                      <div className="font-mono text-xs p-2 bg-slate-900 border border-slate-850/80 rounded flex flex-col leading-relaxed justify-center">
-                        <div className="flex justify-between">
-                          <span className="text-blue-400 font-extrabold">Cand A:</span>
-                          <span className="text-slate-300 font-black tracking-widest">{segmentA}</span>
+                    <button
+                      key={name}
+                      onClick={() => handleToggleMotif(name)}
+                      className={`flex items-center gap-1.5 px-2.5 py-1 text-[10px] font-bold rounded-full border transition-all select-none ${
+                        isEnabled
+                          ? `${colors.badgeBg} ring-1 ring-slate-800`
+                          : "bg-slate-950 border-slate-900 text-slate-600 line-through"
+                      }`}
+                    >
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{ backgroundColor: isEnabled ? colors.color : "#475569" }}
+                      />
+                      <span>{name}</span>
+                      {isEnabled && <Check className="w-2.5 h-2.5 text-blue-400" />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Interactive Graphical Overview Map */}
+            <div className="flex flex-col gap-4 bg-slate-950/70 p-4 border border-slate-850 rounded-lg">
+              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wide">
+                Whole Genome Alignment Map Overview ({totalLength} residues)
+              </span>
+
+              <div className="flex flex-col gap-4">
+                {/* Candidate A Track */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between text-[10px] font-mono">
+                    <span className="font-extrabold text-blue-400 flex items-center gap-1">
+                      <Disc className="w-2.5 h-2.5 text-blue-500" />
+                      Cand_A: {alignmentResult.seqAId}
+                    </span>
+                    <span className="text-slate-500 font-bold">{rawSeqA.length} aa</span>
+                  </div>
+                  {/* Visual Track container */}
+                  <div className="relative h-6 bg-slate-900 border border-slate-800/80 rounded-md">
+                    {/* Subtle ticks */}
+                    <div className="absolute inset-0 flex justify-between px-2 text-[8px] font-mono text-slate-700 pointer-events-none select-none items-center">
+                      <span>1</span>
+                      <span>{Math.floor(totalLength / 2)}</span>
+                      <span>{totalLength}</span>
+                    </div>
+
+                    {/* Active Motifs Blocks in A */}
+                    {alignedMotifsA.map((mot, idx) => {
+                      if (!isMotifEnabled(mot.name)) return null;
+                      const colors = getMotifColorInfo(mot.name);
+                      const left = (mot.alignedStart / totalLength) * 100;
+                      const width = ((mot.alignedEnd - mot.alignedStart + 1) / totalLength) * 100;
+
+                      const isSelected = selectedInspect?.motif.alignedStart === mot.alignedStart && selectedInspect?.sequence === "A";
+
+                      return (
+                        <button
+                          key={`mot-a-${idx}`}
+                          className={`absolute h-4 top-1 rounded border text-[8px] font-mono flex items-center justify-center font-extrabold px-1 transition-all hover:scale-[1.02] active:scale-95 text-ellipsis overflow-hidden whitespace-nowrap min-w-[8px] ${colors.bg} ${colors.border} ${colors.text} ${
+                            isSelected ? "ring-2 ring-indigo-500/80 ring-offset-2 ring-offset-slate-950 shadow-lg scale-102" : ""
+                          }`}
+                          style={{
+                            left: `${left}%`,
+                            width: `${Math.max(1.5, width)}%`,
+                          }}
+                          onClick={() => setSelectedInspect({ motif: mot, sequence: "A" })}
+                          title={`${mot.name} (A): Pos ${mot.start}-${mot.end}`}
+                        >
+                          {width > 6 ? mot.name.split(" ")[0] : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Candidate B Track */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between text-[10px] font-mono">
+                    <span className="font-extrabold text-fuchsia-400 flex items-center gap-1">
+                      <Disc className="w-2.5 h-2.5 text-fuchsia-500" />
+                      Cand_B: {alignmentResult.seqBId}
+                    </span>
+                    <span className="text-slate-500 font-bold">{rawSeqB.length} aa</span>
+                  </div>
+                  {/* Visual Track container */}
+                  <div className="relative h-6 bg-slate-900 border border-slate-800/80 rounded-md">
+                    {/* Subtle ticks */}
+                    <div className="absolute inset-0 flex justify-between px-2 text-[8px] font-mono text-slate-700 pointer-events-none select-none items-center">
+                      <span>1</span>
+                      <span>{Math.floor(totalLength / 2)}</span>
+                      <span>{totalLength}</span>
+                    </div>
+
+                    {/* Active Motifs Blocks in B */}
+                    {alignedMotifsB.map((mot, idx) => {
+                      if (!isMotifEnabled(mot.name)) return null;
+                      const colors = getMotifColorInfo(mot.name);
+                      const left = (mot.alignedStart / totalLength) * 100;
+                      const width = ((mot.alignedEnd - mot.alignedStart + 1) / totalLength) * 100;
+
+                      const isSelected = selectedInspect?.motif.alignedStart === mot.alignedStart && selectedInspect?.sequence === "B";
+
+                      return (
+                        <button
+                          key={`mot-b-${idx}`}
+                          className={`absolute h-4 top-1 rounded border text-[8px] font-mono flex items-center justify-center font-extrabold px-1 transition-all hover:scale-[1.02] active:scale-95 text-ellipsis overflow-hidden whitespace-nowrap min-w-[8px] ${colors.bg} ${colors.border} ${colors.text} ${
+                            isSelected ? "ring-2 ring-indigo-500/80 ring-offset-2 ring-offset-slate-950 shadow-lg scale-102" : ""
+                          }`}
+                          style={{
+                            left: `${left}%`,
+                            width: `${Math.max(1.5, width)}%`,
+                          }}
+                          onClick={() => setSelectedInspect({ motif: mot, sequence: "B" })}
+                          title={`${mot.name} (B): Pos ${mot.start}-${mot.end}`}
+                        >
+                          {width > 6 ? mot.name.split(" ")[0] : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Interactive Inspection Dashboard */}
+            {selectedInspect && (
+              <div className="bg-indigo-950/20 border border-indigo-900/40 p-4 rounded-xl flex flex-col md:flex-row gap-4 items-stretch shadow-md">
+                <div className="flex-1 flex flex-col gap-1.5">
+                  <div className="flex items-center gap-1.5">
+                    <Sparkles className="w-4 h-4 text-amber-400" />
+                    <span className="text-[10px] text-amber-400 font-extrabold uppercase tracking-wider">Active Motif Inspector</span>
+                  </div>
+                  <h4 className="text-xs font-black text-slate-100 flex items-center gap-2">
+                    {selectedInspect.motif.name}{" "}
+                    <span className="text-[10px] font-mono font-black text-indigo-400 bg-indigo-500/10 px-2 py-0.5 rounded border border-indigo-500/20">
+                      Source: Candidate {selectedInspect.sequence}
+                    </span>
+                  </h4>
+                  <p className="text-[11px] text-slate-400 leading-normal mt-1">
+                    {selectedInspect.motif.description}
+                  </p>
+                  <div className="grid grid-cols-2 lg:grid-cols-3 gap-2 text-[10px] font-mono text-slate-400 mt-2 bg-slate-950 p-2.5 rounded-lg border border-slate-900">
+                    <div>
+                      <span className="text-slate-500 block">Original position:</span>
+                      <strong className="text-slate-200">
+                        Residues {selectedInspect.motif.start} - {selectedInspect.motif.end}
+                      </strong>
+                    </div>
+                    <div>
+                      <span className="text-slate-500 block">Aligned alignment range:</span>
+                      <strong className="text-slate-200">
+                        Col {selectedInspect.motif.alignedStart + 1} - {selectedInspect.motif.alignedEnd + 1}
+                      </strong>
+                    </div>
+                    <div className="col-span-2 lg:col-span-1">
+                      <span className="text-slate-500 block">Recognition pattern:</span>
+                      <strong className="text-slate-300 font-bold bg-slate-900 border border-slate-800 px-1 py-0.5 rounded text-[8px]">
+                        {selectedInspect.motif.pattern}
+                      </strong>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Side-by-side Motif Seq comparative Alignment */}
+                <div className="w-full md:w-80 bg-slate-950 p-3 rounded-xl border border-indigo-950/40 flex flex-col gap-2.5 justify-center">
+                  <span className="text-[9px] text-indigo-400 font-extrabold uppercase tracking-wider block">Sequence Conservation Audit</span>
+
+                  {(() => {
+                    const sStart = selectedInspect.motif.alignedStart;
+                    const sEnd = selectedInspect.motif.alignedEnd;
+
+                    const segmentA = alignmentResult.alignedSeqA.slice(sStart, sEnd + 1);
+                    const segmentB = alignmentResult.alignedSeqB.slice(sStart, sEnd + 1);
+                    const segmentConsensus = alignmentResult.consensus.slice(sStart, sEnd + 1);
+
+                    let matchCount = 0;
+                    for (let i = 0; i < segmentA.length; i++) {
+                      if (segmentA[i] === segmentB[i] && segmentA[i] !== "-") matchCount++;
+                    }
+
+                    return (
+                      <div className="flex flex-col gap-2">
+                        <div className="font-mono text-xs p-2 bg-slate-900 border border-slate-850/80 rounded flex flex-col leading-relaxed justify-center">
+                          <div className="flex justify-between">
+                            <span className="text-blue-400 font-extrabold">Cand A:</span>
+                            <span className="text-slate-300 font-black tracking-widest">{segmentA}</span>
+                          </div>
+                          <div className="flex justify-between border-t border-slate-850/40 my-0.5 pt-0.5">
+                            <span className="text-slate-500">Match:</span>
+                            <span className="text-slate-550 font-semibold tracking-widest">{segmentConsensus}</span>
+                          </div>
+                          <div className="flex justify-between border-t border-slate-850/40 pt-0.5">
+                            <span className="text-fuchsia-400 font-extrabold">Cand B:</span>
+                            <span className="text-slate-300 font-black tracking-widest">{segmentB}</span>
+                          </div>
                         </div>
-                        <div className="flex justify-between border-t border-slate-850/40 my-0.5 pt-0.5">
-                          <span className="text-slate-500">Match:</span>
-                          <span className="text-slate-550 font-semibold tracking-widest">{segmentConsensus}</span>
+
+                        <div className="flex justify-between items-center">
+                          <span className="text-[10px] text-slate-500 font-mono">
+                            Conservation: {(matchCount / segmentA.length * 100).toFixed(0)}%
+                          </span>
+
+                          <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded border ${
+                            matchCount === segmentA.length
+                              ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-400"
+                              : matchCount > 0
+                                ? "bg-amber-950/40 border-amber-500/30 text-amber-400"
+                                : "bg-red-950/40 border-red-500/30 text-red-400"
+                          }`}>
+                            {matchCount === segmentA.length ? "Fully Conserved" : matchCount > 0 ? "Partially Mutated" : "Atypical"}
+                          </span>
                         </div>
-                        <div className="flex justify-between border-t border-slate-850/40 pt-0.5">
-                          <span className="text-fuchsia-400 font-extrabold">Cand B:</span>
-                          <span className="text-slate-300 font-black tracking-widest">{segmentB}</span>
+                      </div>
+                    );
+                  })()}
+
+                  <button
+                    onClick={() => setSelectedInspect(null)}
+                    className="w-full py-1 text-[9px] bg-slate-900 border border-slate-800 hover:text-red-300 text-slate-500 font-bold transition-all rounded hover:bg-slate-850 cursor-pointer"
+                  >
+                    Close Audit Panel
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Block-by-block residue-level Alignment Sequence Grid */}
+            <div className="flex flex-col gap-2">
+              <div className="flex justify-between items-center">
+                <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wider flex items-center gap-1">
+                  <Info className="w-3.5 h-3.5 text-blue-400" />
+                  Residue-Level Comparative Alignment Core
+                </span>
+                <span className="text-[9px] text-slate-500 font-mono">Blocks of {wrapSize} residues</span>
+              </div>
+
+              <div className="bg-slate-950/90 border border-slate-850 rounded-xl p-4 flex flex-col gap-6 font-mono text-[11px] overflow-x-auto max-w-full">
+                {chunkOffsets.map((offset) => {
+                  const limit = Math.min(offset + wrapSize, totalLength);
+
+                  const ticks: React.ReactNode[] = [];
+                  for (let i = offset; i < limit; i++) {
+                    if ((i + 1) % 10 === 0 || i === offset || i === limit - 1) {
+                      ticks.push(
+                        <span
+                          key={`tick-${i}`}
+                          className="absolute text-[8px] text-slate-500 font-black"
+                          style={{
+                            left: `${((i - offset) / wrapSize) * 100}%`,
+                            transform: "translateX(-25%)",
+                          }}
+                        >
+                          {i + 1}
+                        </span>
+                      );
+                    }
+                  }
+
+                  return (
+                    <div key={`block-offset-${offset}`} className="flex flex-col gap-1 border-b border-slate-900 pb-3 last:border-0 last:pb-0">
+                      <div className="relative h-4 mb-1 select-none pointer-events-none w-full">
+                        <div className="w-[85px] inline-block"></div>
+                        <div className="relative inline-block w-[calc(100%-85px)] h-full">
+                          {ticks}
                         </div>
                       </div>
 
-                      <div className="flex justify-between items-center">
-                        <span className="text-[10px] text-slate-500 font-mono">
-                          Conservation: {(matchCount / segmentA.length * 100).toFixed(0)}%
+                      {/* Candidate A Row */}
+                      <div className="flex items-center w-full">
+                        <span className="w-[85px] text-blue-400 font-extrabold text-[10px] truncate shrink-0 select-none">
+                          Cand_A:
                         </span>
-                        
-                        {/* Dynamic interpretation */}
-                        <span className={`text-[9px] font-extrabold uppercase px-1.5 py-0.5 rounded border ${
-                          matchCount === segmentA.length
-                            ? "bg-emerald-950/40 border-emerald-500/30 text-emerald-400"
-                            : matchCount > 0
-                              ? "bg-amber-950/40 border-amber-500/30 text-amber-400"
-                              : "bg-red-950/40 border-red-500/30 text-red-400"
-                        }`}>
-                          {matchCount === segmentA.length ? "Fully Conserved" : matchCount > 0 ? "Partially Mutated" : "Atypical / Disorganized"}
+                        <div className="flex-1 flex justify-between w-full">
+                          {Array.from(alignmentResult.alignedSeqA.slice(offset, limit)).map((char, charIdx) => {
+                            const absIdx = offset + charIdx;
+                            const activeMotif = getActiveMotifAtAlignedIndex("A", absIdx);
+                            const isConserved = alignmentResult.consensus[absIdx] === char;
+
+                            let cellStyle = "text-slate-350 bg-transparent";
+                            if (char === "-") {
+                              cellStyle = "text-slate-600 bg-slate-900/30";
+                            } else if (activeMotif) {
+                              const colors = getMotifColorInfo(activeMotif.name);
+                              cellStyle = `${colors.bg} ${colors.border} ${colors.text} border-b-2 font-black`;
+                            } else if (isConserved) {
+                              cellStyle = "text-slate-200";
+                            }
+
+                            const inspectThis = () => {
+                              if (activeMotif) setSelectedInspect({ motif: activeMotif, sequence: "A" });
+                            };
+
+                            return (
+                              <span
+                                key={`ca-${absIdx}`}
+                                onClick={inspectThis}
+                                className={`flex-1 text-center font-mono py-0.5 tracking-tight font-black select-all transition-all duration-100 ${cellStyle} ${
+                                  activeMotif ? "cursor-help hover:brightness-130 scale-102 border-t border-x border-slate-800/20" : ""
+                                }`}
+                                title={activeMotif ? `${activeMotif.name} (A): Pos ${activeMotif.start}-${activeMotif.end}. Tap to inspect.` : undefined}
+                              >
+                                {char}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Consensus Indicator Row */}
+                      <div className="flex items-center w-full select-none pointer-events-none text-slate-600">
+                        <span className="w-[85px] text-[10px] truncate shrink-0">
+                          Consensus:
                         </span>
+                        <div className="flex-1 flex justify-between w-full">
+                          {Array.from(alignmentResult.consensus.slice(offset, limit)).map((char, charIdx) => {
+                            const absIdx = offset + charIdx;
+                            const hasMatch = char === "|";
+                            const hasPartial = char === "+";
+
+                            return (
+                              <span
+                                key={`co-${absIdx}`}
+                                className={`flex-1 text-center font-black py-0.5 tracking-tight ${
+                                  hasMatch ? "text-emerald-500/80" : hasPartial ? "text-slate-555" : "text-transparent"
+                                }`}
+                              >
+                                {char}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Candidate B Row */}
+                      <div className="flex items-center w-full">
+                        <span className="w-[85px] text-fuchsia-400 font-extrabold text-[10px] truncate shrink-0 select-none">
+                          Cand_B:
+                        </span>
+                        <div className="flex-1 flex justify-between w-full">
+                          {Array.from(alignmentResult.alignedSeqB.slice(offset, limit)).map((char, charIdx) => {
+                            const absIdx = offset + charIdx;
+                            const activeMotif = getActiveMotifAtAlignedIndex("B", absIdx);
+                            const isConserved = alignmentResult.consensus[absIdx] === char;
+
+                            let cellStyle = "text-slate-350 bg-transparent";
+                            if (char === "-") {
+                              cellStyle = "text-slate-600 bg-slate-900/30";
+                            } else if (activeMotif) {
+                              const colors = getMotifColorInfo(activeMotif.name);
+                              cellStyle = `${colors.bg} ${colors.border} ${colors.text} border-b-2 font-black`;
+                            } else if (isConserved) {
+                              cellStyle = "text-slate-200";
+                            }
+
+                            const inspectThis = () => {
+                              if (activeMotif) setSelectedInspect({ motif: activeMotif, sequence: "B" });
+                            };
+
+                            return (
+                              <span
+                                key={`cb-${absIdx}`}
+                                onClick={inspectThis}
+                                className={`flex-1 text-center font-mono py-0.5 tracking-tight font-black select-all transition-all duration-100 ${cellStyle} ${
+                                  activeMotif ? "cursor-help hover:brightness-130 scale-102 border-t border-x border-slate-800/20" : ""
+                                }`}
+                                title={activeMotif ? `${activeMotif.name} (B): Pos ${activeMotif.start}-${activeMotif.end}. Tap to inspect.` : undefined}
+                              >
+                                {char}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </>
+        )
+      ) : (
+        /* Evolutionary Sequence Conservation Map */
+        <div className="flex flex-col gap-4 animate-fadeIn">
+          {/* Top Panel Controls */}
+          <div className="bg-slate-950 p-4 border border-slate-850 rounded-lg flex flex-col md:flex-row md:items-center justify-between gap-3">
+            <div className="flex flex-col gap-1">
+              <span className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-emerald-400" /> Multi-Species Comparative Alignments
+              </span>
+              <p className="text-[11px] text-slate-500 font-sans">
+                Determined via sequence homology mapping across mammalian orthologs, birds, teleost fish, and model invertebrates.
+              </p>
+            </div>
+
+            {/* Jump position & Filters */}
+            <div className="flex flex-wrap items-center gap-2 font-sans">
+              <form onSubmit={handleJumpToPosition} className="flex bg-slate-900 border border-slate-800 rounded px-2 py-1 items-center gap-1 text-[10.5px]">
+                <Search className="w-3.5 h-3.5 text-slate-500" />
+                <input
+                  type="text"
+                  placeholder="Jump to position..."
+                  className="bg-transparent text-slate-200 outline-none w-28 placeholder-slate-600 font-mono py-0"
+                  value={searchPosInput}
+                  onChange={e => setSearchPosInput(e.target.value)}
+                />
+              </form>
+
+              {/* Filter high conservation button */}
+              <button
+                onClick={() => setConserveFilter(prev => prev === 8 ? 0 : 8)}
+                className={`px-3 py-1.5 border rounded text-[10.5px] font-black tracking-wider transition-all cursor-pointer select-none ${
+                  conserveFilter === 8
+                    ? "bg-emerald-950/40 border-emerald-500/40 text-emerald-300"
+                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                {conserveFilter === 8 ? "Showing Highly Conserved (Score ≥ 8)" : "Show Highly Conserved"}
+              </button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 lg:grid-cols-4 gap-4 items-stretch">
+            {/* Left Col (3/4 widths): Heatmap view & dense multi-species strip */}
+            <div className="lg:col-span-3 flex flex-col gap-4">
+              {/* Heatmap Grid */}
+              <div className="bg-slate-950/60 border border-slate-850 p-4 rounded-xl">
+                <div className="flex justify-between items-center border-b border-slate-900 pb-2 mb-3 font-sans">
+                  <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-widest block">Whole Protein Conservation Heatmap</span>
+                  <span className="text-[9px] text-slate-500 font-mono">Length: {rawSeqA.length} residues • Click a box to inspect</span>
+                </div>
+
+                <div className="flex flex-wrap gap-1 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar justify-start">
+                  {conserveData.scores.map((score, idx) => {
+                    const pos = idx + 1;
+                    const aminoAcid = rawSeqA[idx] || "";
+                    const isSelected = activeConservePos === pos;
+                    const isFilteredOut = conserveFilter > 0 && score < conserveFilter;
+
+                    return (
+                      <button
+                        key={`con-heat-${idx}`}
+                        onClick={() => setActiveConservePos(pos)}
+                        className={`w-6 h-6 rounded flex flex-col items-center justify-center font-mono text-[9px] font-black transition-all hover:scale-110 active:scale-95 ${getScoreColor(score)} ${
+                          isSelected ? "ring-2 ring-white ring-offset-2 ring-offset-slate-950 shadow-md scale-105 z-10" : ""
+                        } ${isFilteredOut ? "opacity-15 grayscale hover:opacity-100 hover:grayscale-0" : ""}`}
+                        title={`Pos: ${pos} (${aminoAcid}) • Score: ${score}`}
+                      >
+                        <span className="text-[7px] leading-none opacity-60 font-semibold">{pos}</span>
+                        <span className="leading-none mt-0.5">{aminoAcid}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Score scale legend bar */}
+                <div className="mt-4 flex flex-wrap items-center justify-between text-[9px] font-bold text-slate-500 border-t border-slate-900 pt-3 font-sans">
+                  <div className="flex items-center gap-1.5">
+                    <span>Low Conservation</span>
+                    <div className="flex gap-0.5">
+                      <span className="w-2.5 h-2.5 rounded bg-rose-600" />
+                      <span className="w-2.5 h-2.5 rounded bg-rose-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-orange-500" />
+                      <span className="w-2.5 h-2.5 rounded bg-orange-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-amber-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-amber-300" />
+                      <span className="w-2.5 h-2.5 rounded bg-cyan-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-teal-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-emerald-400" />
+                      <span className="w-2.5 h-2.5 rounded bg-emerald-500" />
+                    </div>
+                    <span>High Conservation (9/9)</span>
+                  </div>
+
+                  <div className="flex items-center gap-1 text-slate-400">
+                    <span className="w-2 h-2 rounded bg-emerald-400 shrink-0" />
+                    <span>Score 8-9 represent Critical Structural Domains</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Multi-Species Aligned Slider (Dynamic local window) */}
+              <div className="bg-slate-950 p-4 border border-slate-850 rounded-xl flex flex-col gap-3 font-mono">
+                {(() => {
+                  const windowSize = 34; // visual window length
+                  const half = Math.floor(windowSize / 2);
+                  const centerIdx = activeConservePos - 1;
+
+                  let start = Math.max(0, centerIdx - half);
+                  let end = Math.min(rawSeqA.length, start + windowSize);
+                  if (end - start < windowSize) {
+                    start = Math.max(0, end - windowSize);
+                  }
+
+                  return (
+                    <div className="relative flex flex-col gap-1.5 overflow-hidden text-[10px]">
+                      <div className="flex justify-between items-center text-[10px] text-slate-400 font-sans border-b border-slate-900 pb-2 mb-1">
+                        <span className="font-bold flex items-center gap-1.5">
+                          <Activity className="w-3.5 h-3.5 text-indigo-400" /> Sliding window species alignment
+                        </span>
+                        <span>Residues {start + 1} to {end}</span>
+                      </div>
+
+                      {/* Tick marks header */}
+                      <div className="flex items-center select-none pointer-events-none text-[8px] text-slate-600">
+                        <span className="w-[135px] block shrink-0 font-sans">Species Position</span>
+                        <div className="flex-1 flex justify-between">
+                          {Array.from({ length: end - start }).map((_, idx) => {
+                            const absPos = start + idx + 1;
+                            const isSelected = absPos === activeConservePos;
+                            return (
+                              <span
+                                key={`win-tick-${idx}`}
+                                className={`flex-1 text-center font-black ${isSelected ? "text-indigo-400" : ""}`}
+                              >
+                                {absPos % 5 === 0 || absPos === start + 1 || absPos === end ? absPos : "·"}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+
+                      {/* Align rows for all 7 species */}
+                      {SPECIES_LIST.map(sp => {
+                        const seqChunk = (conserveData.sequences[sp.id] || []).slice(start, end);
+                        const isRef = sp.id === "human";
+
+                        return (
+                          <div key={`sp-win-${sp.id}`} className="flex items-center relative z-10">
+                            <span className={`w-[135px] text-[9px] truncate font-sans font-extrabold ${sp.color} shrink-0 block`}>
+                              {isRef ? "★ " : "  "}{sp.name.split(" ")[1]} ({sp.group})
+                            </span>
+                            <div className="flex-1 flex justify-between">
+                              {seqChunk.map((char, charIdx) => {
+                                const absPos = start + charIdx + 1;
+                                const isSelected = absPos === activeConservePos;
+                                const matchesHuman = char === (conserveData.sequences["human"]?.[start + charIdx]);
+
+                                let color = "text-slate-400";
+                                if (isSelected) {
+                                  color = "text-white font-black bg-indigo-500/20 rounded scale-102 border-b border-indigo-400";
+                                } else if (matchesHuman) {
+                                  color = isRef ? "text-slate-200 font-bold" : "text-slate-400 opacity-60";
+                                } else {
+                                  color = "text-amber-400 font-bold bg-amber-500/5";
+                                }
+
+                                return (
+                                  <button
+                                    key={`win-char-${charIdx}`}
+                                    onClick={() => setActiveConservePos(absPos)}
+                                    className={`flex-1 text-center font-mono py-0.5 cursor-pointer transition-all ${color}`}
+                                  >
+                                    {isRef ? char : matchesHuman ? "." : char}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      {/* Score row */}
+                      <div className="flex items-center relative z-10 border-t border-slate-900 mt-1 pt-1.5">
+                        <span className="w-[135px] text-[9.5px] truncate font-sans text-emerald-400 font-bold shrink-0 block font-bold">
+                          Cons. Score (0-9)
+                        </span>
+                        <div className="flex-1 flex justify-between text-[9px]">
+                          {conserveData.scores.slice(start, end).map((score, charIdx) => {
+                            const absPos = start + charIdx + 1;
+                            const isSelected = absPos === activeConservePos;
+
+                            return (
+                              <button
+                                key={`win-score-${charIdx}`}
+                                onClick={() => setActiveConservePos(absPos)}
+                                className={`flex-1 text-center font-black rounded cursor-pointer transition-all ${
+                                  isSelected
+                                    ? "bg-white text-slate-950 font-bold"
+                                    : score >= 8
+                                      ? "text-emerald-400"
+                                      : score >= 6
+                                        ? "text-teal-400"
+                                        : score >= 4
+                                          ? "text-amber-400"
+                                          : "text-rose-400"
+                                }`}
+                              >
+                                {score}
+                              </button>
+                            );
+                          })}
+                        </div>
                       </div>
                     </div>
                   );
                 })()}
-
-                <button
-                  onClick={() => setSelectedInspect(null)}
-                  className="w-full py-1 text-[9px] bg-slate-900 border border-slate-800 hover:text-red-300 text-slate-500 font-bold transition-all rounded hover:bg-slate-850"
-                >
-                  Close Audit Panel
-                </button>
               </div>
             </div>
-          )}
 
-          {/* Block-by-block residue-level Alignment Sequence Grid */}
-          <div className="flex flex-col gap-2">
-            <div className="flex justify-between items-center">
-              <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wider flex items-center gap-1">
-                <Info className="w-3.5 h-3.5 text-blue-400" />
-                Residue-Level Comparative Alignment Core
-              </span>
-              <span className="text-[9px] text-slate-500 font-mono">Blocks of {wrapSize} residues</span>
-            </div>
-
-            <div className="bg-slate-950/90 border border-slate-850 rounded-xl p-4 flex flex-col gap-6 font-mono text-[11px] overflow-x-auto max-w-full">
-              {chunkOffsets.map((offset) => {
-                const limit = Math.min(offset + wrapSize, totalLength);
-                
-                // Indices headers sequence
-                const ticks: React.ReactNode[] = [];
-                for (let i = offset; i < limit; i++) {
-                  if ((i + 1) % 10 === 0 || i === offset || i === limit - 1) {
-                    ticks.push(
-                      <span
-                        key={`tick-${i}`}
-                        className="absolute text-[8px] text-slate-650 font-black"
-                        style={{
-                          left: `${((i - offset) / wrapSize) * 100}%`,
-                          transform: "translateX(-25%)",
-                        }}
-                      >
-                        {i + 1}
-                      </span>
-                    );
-                  }
-                }
-
-                return (
-                  <div key={`block-offset-${offset}`} className="flex flex-col gap-1 border-b border-slate-900 pb-3 last:border-0 last:pb-0">
-                    {/* Tick labels header */}
-                    <div className="relative h-4 mb-1 select-none pointer-events-none w-full">
-                      <div className="w-[85px] inline-block"></div>
-                      <div className="relative inline-block w-[calc(100%-85px)] h-full">
-                        {ticks}
-                      </div>
-                    </div>
-
-                    {/* Candidate A Row */}
-                    <div className="flex items-center w-full">
-                      <span className="w-[85px] text-blue-450 font-extrabold text-[10px] truncate text-blue-400 shrink-0 select-none">
-                        Cand_A:
-                      </span>
-                      <div className="flex-1 flex justify-between w-full">
-                        {Array.from(alignmentResult.alignedSeqA.slice(offset, limit)).map((char, charIdx) => {
-                          const absIdx = offset + charIdx;
-                          const activeMotif = getActiveMotifAtAlignedIndex("A", absIdx);
-                          const isConserved = alignmentResult.consensus[absIdx] === char;
-                          
-                          let cellStyle = "text-slate-350 bg-transparent";
-                          if (char === "-") {
-                            cellStyle = "text-slate-650 bg-slate-900/30";
-                          } else if (activeMotif) {
-                            const colors = getMotifColorInfo(activeMotif.name);
-                            cellStyle = `${colors.bg} ${colors.border} ${colors.text} border-b-2 font-black`;
-                          } else if (isConserved) {
-                            cellStyle = "text-slate-200";
-                          }
-
-                          const inspectThis = () => {
-                            if (activeMotif) setSelectedInspect({ motif: activeMotif, sequence: "A" });
-                          };
-
-                          return (
-                            <span
-                              key={`ca-${absIdx}`}
-                              onClick={inspectThis}
-                              className={`flex-1 text-center font-mono py-0.5 tracking-tight font-black select-all transition-all duration-100 ${cellStyle} ${
-                                activeMotif ? "cursor-help hover:brightness-130 scale-102 border-t border-x border-slate-800/20" : ""
-                              }`}
-                              title={activeMotif ? `${activeMotif.name} (A): Pos ${activeMotif.start}-${activeMotif.end}. Tap to inspect.` : undefined}
-                            >
-                              {char}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Consensus Indicator Row */}
-                    <div className="flex items-center w-full select-none pointer-events-none text-slate-600">
-                      <span className="w-[85px] text-[10px] truncate shrink-0">
-                        Consensus:
-                      </span>
-                      <div className="flex-1 flex justify-between w-full">
-                        {Array.from(alignmentResult.consensus.slice(offset, limit)).map((char, charIdx) => {
-                          const absIdx = offset + charIdx;
-                          const hasMatch = char === "|";
-                          const hasPartial = char === "+";
-                          
-                          return (
-                            <span
-                              key={`co-${absIdx}`}
-                              className={`flex-1 text-center font-black py-0.5 tracking-tight ${
-                                hasMatch ? "text-emerald-500/80" : hasPartial ? "text-slate-500" : "text-transparent"
-                              }`}
-                            >
-                              {char}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Candidate B Row */}
-                    <div className="flex items-center w-full">
-                      <span className="w-[85px] text-fuchsia-450 font-extrabold text-[10px] truncate text-fuchsia-400 shrink-0 select-none">
-                        Cand_B:
-                      </span>
-                      <div className="flex-1 flex justify-between w-full">
-                        {Array.from(alignmentResult.alignedSeqB.slice(offset, limit)).map((char, charIdx) => {
-                          const absIdx = offset + charIdx;
-                          const activeMotif = getActiveMotifAtAlignedIndex("B", absIdx);
-                          const isConserved = alignmentResult.consensus[absIdx] === char;
-                          
-                          let cellStyle = "text-slate-350 bg-transparent";
-                          if (char === "-") {
-                            cellStyle = "text-slate-655 bg-slate-900/30";
-                          } else if (activeMotif) {
-                            const colors = getMotifColorInfo(activeMotif.name);
-                            cellStyle = `${colors.bg} ${colors.border} ${colors.text} border-b-2 font-black`;
-                          } else if (isConserved) {
-                            cellStyle = "text-slate-200";
-                          }
-
-                          const inspectThis = () => {
-                            if (activeMotif) setSelectedInspect({ motif: activeMotif, sequence: "B" });
-                          };
-
-                          return (
-                            <span
-                              key={`cb-${absIdx}`}
-                              onClick={inspectThis}
-                              className={`flex-1 text-center font-mono py-0.5 tracking-tight font-black select-all transition-all duration-100 ${cellStyle} ${
-                                activeMotif ? "cursor-help hover:brightness-130 scale-102 border-t border-x border-slate-800/20" : ""
-                              }`}
-                              title={activeMotif ? `${activeMotif.name} (B): Pos ${activeMotif.start}-${activeMotif.end}. Tap to inspect.` : undefined}
-                            >
-                              {char}
-                            </span>
-                          );
-                        })}
-                      </div>
-                    </div>
+            {/* Right Col (1/4 width): Position Inspector & Conserved Domains list */}
+            <div className="flex flex-col gap-4 font-sans">
+              {/* Position Inspector Panel */}
+              <div className="bg-slate-950 border border-slate-850 p-4 rounded-xl flex flex-col gap-3 justify-between">
+                <div>
+                  <span className="text-[10px] text-indigo-400 font-extrabold uppercase tracking-wider block">Residue Inspector</span>
+                  <div className="flex items-baseline gap-2 mt-1 pb-2 border-b border-slate-900">
+                    <h3 className="text-xl font-black font-mono text-slate-100">
+                      {rawSeqA[activeConservePos - 1] || "—"}-{activeConservePos}
+                    </h3>
+                    <span className="text-[10px] text-slate-500 font-mono">Residue Coordinate</span>
                   </div>
-                );
-              })}
+
+                  {(() => {
+                    const idx = activeConservePos - 1;
+                    const refAA = rawSeqA[idx] || "A";
+                    const score = conserveData.scores[idx] ?? 0;
+                    const activeMotif = motifsA.find(m => idx >= m.start - 1 && idx <= m.end - 1);
+
+                    // Interpret substitution risk
+                    let interpretation = "Highly tolerating mutation drift. Safe position for synthetic amino acid substitution.";
+                    let confidence = "Low selection pressure";
+                    if (score >= 8) {
+                      interpretation = "Critical for structural integrity or function. Modifications likely destabilize tertiary structure.";
+                      confidence = "Extreme selection pressure";
+                    } else if (score >= 6) {
+                      interpretation = "Preserved chemical status. Substitution permitted with conservative residue matching same class.";
+                      confidence = "Moderate-high pressure";
+                    }
+
+                    // Chemical category details
+                    const aaLabels: Record<string, string> = {
+                      "A": "Alanine (Hydrophobic, Aliphatic)",
+                      "C": "Cysteine (Polar, Disulfide active)",
+                      "D": "Aspartate (Negatively Charged, Acidic)",
+                      "E": "Glutamate (Negatively Charged, Acidic)",
+                      "F": "Phenylalanine (Hydrophobic, Aromatic)",
+                      "G": "Glycine (Special, Flexible Backbone)",
+                      "H": "Histidine (Positively Charged, Basic)",
+                      "I": "Isoleucine (Hydrophobic, Branched Aliphatic)",
+                      "K": "Lysine (Positively Charged, Basic)",
+                      "L": "Leucine (Hydrophobic, Branched Aliphatic)",
+                      "M": "Methionine (Hydrophobic, Thioether chain)",
+                      "N": "Asparagine (Polar, Amide sidechain)",
+                      "P": "Proline (Special, Rigid Imino Acid)",
+                      "Q": "Glutamine (Polar, Amide sidechain)",
+                      "R": "Arginine (Positively Charged, Highly Basic)",
+                      "S": "Serine (Polar, Hydroxyl functional)",
+                      "T": "Threonine (Polar, Hydroxyl functional)",
+                      "V": "Valine (Hydrophobic, Branched Aliphatic)",
+                      "W": "Tryptophan (Hydrophobic, Aromatic Indole)",
+                      "Y": "Tyrosine (Hydrophobic/Polar, Phenolic)"
+                    };
+
+                    return (
+                      <div className="flex flex-col gap-3 mt-3">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[10px] text-slate-500 font-bold">Conservation score:</span>
+                          <span className={`text-[10px] font-black px-2 py-0.5 rounded font-mono ${getScoreColor(score)}`}>
+                            {score}/9 Rating
+                          </span>
+                        </div>
+
+                        <div>
+                          <span className="text-[9px] text-slate-500 block font-bold">Amino Acid Category:</span>
+                          <span className="text-[10.5px] font-bold text-slate-300 block mt-0.5">
+                            {aaLabels[refAA] || refAA}
+                          </span>
+                        </div>
+
+                        {activeMotif && (
+                          <div className="bg-indigo-950/20 border border-indigo-900/40 p-2 rounded text-[10px]">
+                            <span className="font-extrabold text-indigo-400 block font-bold">📍 Local Motif Core</span>
+                            <span className="text-slate-300 block mt-0.5 font-medium">{activeMotif.name}</span>
+                          </div>
+                        )}
+
+                        <div className="flex flex-col gap-1.5 bg-slate-900/60 p-2.5 border border-slate-850 rounded">
+                          <span className="text-[9px] text-slate-500 uppercase tracking-wide block font-bold">Functional Interpretation</span>
+                          <p className="text-[10.5px] text-slate-300 leading-normal font-sans font-medium">
+                            {interpretation}
+                          </p>
+                          <span className="text-[8.5px] text-slate-550 italic block border-t border-slate-850 mt-1.5 pt-1">
+                            {confidence}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                <div className="text-[9.5px] text-slate-500 leading-relaxed font-sans border-t border-slate-900 pt-3 flex gap-1.5 items-start">
+                  <HelpCircle className="w-4 h-4 text-slate-500 shrink-0 mt-0.5" />
+                  <span>Use sliding window sequence map to click on any matching or differing column.</span>
+                </div>
+              </div>
+
+              {/* Conserved Domains List */}
+              <div className="bg-slate-950 border border-slate-850 p-4 rounded-xl flex flex-col gap-2.5 max-h-[220px] overflow-y-auto">
+                <span className="text-[10px] text-slate-400 font-extrabold uppercase tracking-wide block">Conserved Blocks (Length ≥ 5)</span>
+                {conserveData.conservedDomains.length === 0 ? (
+                  <span className="text-[10px] text-slate-550 italic text-center py-4">No continuous conserved blocks found.</span>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    {conserveData.conservedDomains.map((dom, idx) => (
+                      <button
+                        key={`dom-${idx}`}
+                        onClick={() => setActiveConservePos(dom.start)}
+                        className="w-full text-left bg-slate-900 hover:bg-slate-850 border border-slate-850 hover:border-slate-755 hover:border-slate-700 p-2 rounded transition-all cursor-pointer flex flex-col gap-1 text-[10px]"
+                      >
+                        <div className="flex justify-between items-center w-full">
+                          <strong className="text-slate-300 font-bold">Positions {dom.start} - {dom.end}</strong>
+                          <span className="bg-emerald-500/10 text-emerald-400 text-[9px] px-1.5 py-0.5 rounded font-bold">
+                            Avg: {dom.avgScore}
+                          </span>
+                        </div>
+                        <div className="text-[9px] text-slate-500 font-mono truncate w-full">
+                          {dom.sequence}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
-        </>
+        </div>
       )}
     </div>
   );

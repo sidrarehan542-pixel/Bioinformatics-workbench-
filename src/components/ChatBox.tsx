@@ -18,6 +18,14 @@ export default function ChatBox({ activeRecord, isOpen = true, onClose }: ChatBo
   const [input, setInput] = useState("");
   const [chatLoading, setChatLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const chatAbortControllerRef = useRef<AbortController | null>(null);
+
+  // Cleanup in-flight requests on unmount to prevent memory leaks
+  useEffect(() => {
+    return () => {
+      chatAbortControllerRef.current?.abort();
+    };
+  }, []);
 
   // Initialize conversations when active record changes
   useEffect(() => {
@@ -61,6 +69,13 @@ export default function ChatBox({ activeRecord, isOpen = true, onClose }: ChatBo
     const queryText = textToSend.trim();
     if (!queryText) return;
 
+    // Abort previous in-flight chat calls
+    if (chatAbortControllerRef.current) {
+      chatAbortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    chatAbortControllerRef.current = controller;
+
     // Append user message
     const updatedMessages = [...messages, { role: "user", content: queryText } as Message];
     setMessages(updatedMessages);
@@ -80,7 +95,8 @@ export default function ChatBox({ activeRecord, isOpen = true, onClose }: ChatBo
         body: JSON.stringify({
           messages: apiMessages,
           activeRecord: activeRecord
-        })
+        }),
+        signal: controller.signal
       });
 
       if (!res.ok) {
@@ -88,14 +104,19 @@ export default function ChatBox({ activeRecord, isOpen = true, onClose }: ChatBo
       }
 
       const data = await res.json();
-      setMessages(prev => [...prev, { role: "ai", content: data.content || "No structural response formulated." }]);
+      if (chatAbortControllerRef.current === controller) {
+        setMessages(prev => [...prev, { role: "ai", content: data.content || "No structural response formulated." }]);
+      }
     } catch (err: any) {
+      if (err.name === "AbortError") return; // Ignore aborted requests
       setMessages(prev => [
         ...prev,
         { role: "ai", content: `❌ **Error:** Connection to AI advisor lost. ${err.message}` }
       ]);
     } finally {
-      setChatLoading(false);
+      if (chatAbortControllerRef.current === controller) {
+        setChatLoading(false);
+      }
     }
   };
 

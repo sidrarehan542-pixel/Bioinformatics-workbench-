@@ -55,7 +55,7 @@ export function calculateMolecularWeight(sequence: string): number {
 /**
  * Computes the net charge of a protein sequence at a given pH.
  */
-function computeNetChargeAtPH(sequence: string, pH: number): number {
+export function computeNetChargeAtPH(sequence: string, pH: number): number {
   const seq = sequence.toUpperCase();
   
   // Count specific residues
