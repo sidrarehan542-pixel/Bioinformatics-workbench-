@@ -11,8 +11,34 @@ import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
+import Stripe from "stripe";
+import admin from "firebase-admin";
 
 dotenv.config();
+
+// Initialize Firebase Admin
+if (admin.apps.length === 0) {
+  admin.initializeApp({
+    projectId: process.env.VITE_FIREBASE_PROJECT_ID || "demo-project"
+  });
+}
+const adminDb = admin.firestore();
+// Fallback if the database ID is provided and is not (default)
+if (process.env.VITE_FIREBASE_DATABASE_ID && process.env.VITE_FIREBASE_DATABASE_ID !== "(default)") {
+  adminDb.settings({ databaseId: process.env.VITE_FIREBASE_DATABASE_ID });
+}
+
+let stripeClient: Stripe | null = null;
+function getStripe(): Stripe {
+  if (!stripeClient) {
+    const key = process.env.STRIPE_SECRET_KEY;
+    if (!key) {
+      throw new Error('STRIPE_SECRET_KEY environment variable is required for payments');
+    }
+    stripeClient = new Stripe(key, { apiVersion: "2025-02-24.acacia" });
+  }
+  return stripeClient;
+}
 
 const isCjs = typeof module !== "undefined" && !!module.exports;
 
@@ -25,7 +51,13 @@ const resolvedDirname = isCjs
   : path.dirname(resolvedFilename);
 
 const app = express();
-app.use(express.json());
+app.use(express.json({
+  verify: (req: any, res, buf) => {
+    if (req.originalUrl.startsWith('/api/webhook')) {
+      req.rawBody = buf;
+    }
+  }
+}));
 app.use(cors());
 
 // Lazy-initialize Gemini AI
@@ -214,7 +246,179 @@ Respond ONLY with raw JSON. Avoid markdown code tags (\`\`\`), backticks, or con
 /**
  * Query endpoint: fetches and aggregates biological records from NCBI, UniProt, or PDB.
  */
-app.get("/api/query", async (req, res) => {
+// ==========================================
+// Stripe Subscription Endpoints
+// ==========================================
+
+app.post("/api/create-checkout-session", async (req, res) => {
+  try {
+    const { tier, userId, userEmail } = req.body;
+    
+    if (!tier || !userId || !userEmail) {
+      return res.status(400).json({ error: "Missing required parameters." });
+    }
+    
+    const stripe = getStripe();
+    
+    // In a real app, mapping tiers to Stripe Price IDs
+    let priceId = "";
+    if (tier === "pro") {
+      priceId = process.env.STRIPE_PRO_PRICE_ID || "price_dummy_pro";
+    } else if (tier === "enterprise") {
+      priceId = process.env.STRIPE_ENTERPRISE_PRICE_ID || "price_dummy_enterprise";
+    } else {
+      return res.status(400).json({ error: "Invalid tier." });
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ["card"],
+      line_items: [
+        {
+          price: priceId,
+          quantity: 1,
+        },
+      ],
+      mode: "subscription",
+      success_url: `${process.env.APP_URL || "http://localhost:3000"}/?success=true&session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.APP_URL || "http://localhost:3000"}/?canceled=true`,
+      customer_email: userEmail,
+      client_reference_id: userId,
+      metadata: {
+        userId,
+        tier
+      }
+    });
+
+    res.json({ id: session.id, url: session.url });
+  } catch (err: any) {
+    console.error("Error creating checkout session:", err);
+    res.status(500).json({ error: err.message || "Failed to create checkout session" });
+  }
+});
+
+app.post("/api/webhook", async (req: any, res) => {
+  const sig = req.headers["stripe-signature"];
+  const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!endpointSecret) {
+    return res.status(400).send("Stripe Webhook Secret not configured.");
+  }
+
+  let event;
+  try {
+    const stripe = getStripe();
+    event = stripe.webhooks.constructEvent(req.rawBody, sig, endpointSecret);
+  } catch (err: any) {
+    console.error("Webhook signature verification failed.", err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object as any;
+      const userId = session.client_reference_id || session.metadata?.userId;
+      const tier = session.metadata?.tier;
+
+      if (userId && tier) {
+        await adminDb.collection("users").doc(userId).update({
+          tier,
+          stripeCustomerId: session.customer,
+          subscriptionId: session.subscription
+        });
+        
+        // Optionally reset usage limits upon upgrade
+        await adminDb.collection("users").doc(userId).collection("usage").doc("tracker").set({
+          userId,
+          apiCalls: 0,
+          lastReset: new Date().toISOString()
+        }, { merge: true });
+        
+        console.log(`User ${userId} successfully upgraded to ${tier} tier.`);
+      }
+    } else if (event.type === "customer.subscription.deleted") {
+      const subscription = event.data.object as any;
+      // Search for the user with this subscription ID
+      const usersSnap = await adminDb.collection("users").where("subscriptionId", "==", subscription.id).get();
+      if (!usersSnap.empty) {
+        const userId = usersSnap.docs[0].id;
+        await adminDb.collection("users").doc(userId).update({
+          tier: "free",
+          subscriptionId: admin.firestore.FieldValue.delete()
+        });
+        console.log(`User ${userId} subscription ended, reverted to free tier.`);
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err: any) {
+    console.error("Error processing webhook:", err);
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+});
+
+// Middleware to verify Firebase Auth and enforce usage tracking/limits
+const requireUsageQuota = async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Authentication required. Please log in to search the database." });
+  }
+
+  const token = authHeader.split("Bearer ")[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    const userId = decodedToken.uid;
+    
+    // Fetch user profile and usage
+    const userRef = adminDb.collection("users").doc(userId);
+    const userDoc = await userRef.get();
+    const userData = userDoc.data();
+    
+    const tier = userData?.tier || "free";
+    let tierLimit = 10;
+    if (tier === "pro") tierLimit = 1000;
+    if (tier === "enterprise") tierLimit = 10000;
+
+    const trackerRef = userRef.collection("usage").doc("tracker");
+    
+    await adminDb.runTransaction(async (transaction) => {
+      const trackerDoc = await transaction.get(trackerRef);
+      let apiCalls = 0;
+      const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+      
+      if (trackerDoc.exists) {
+        const data = trackerDoc.data()!;
+        if (data.lastReset === today) {
+          apiCalls = data.apiCalls;
+        } else {
+          // Reset for the new day
+          apiCalls = 0;
+        }
+      }
+      
+      if (apiCalls >= tierLimit) {
+        throw new Error(`Usage limit exceeded. Your ${tier.toUpperCase()} tier allows ${tierLimit} queries per day. Please upgrade your tier.`);
+      }
+      
+      // Increment
+      transaction.set(trackerRef, {
+        userId,
+        apiCalls: apiCalls + 1,
+        lastReset: today
+      }, { merge: true });
+    });
+    
+    // Proceed to route
+    next();
+  } catch (err: any) {
+    if (err.message.includes("Usage limit exceeded")) {
+      return res.status(429).json({ error: err.message });
+    }
+    console.error("Auth/Usage verification failed:", err);
+    return res.status(401).json({ error: "Invalid or expired authentication token." });
+  }
+};
+
+app.get("/api/query", requireUsageQuota, async (req, res) => {
   const db = (req.query.db as string) || "omni";
   const idRaw = req.query.id as string;
 
@@ -833,7 +1037,7 @@ app.get("/api/pdb/spatial", async (req, res) => {
 /**
  * Chat endpoint: allows users to ask biological or structural questions about the active protein/gene record
  */
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireUsageQuota, async (req, res) => {
   const { messages, activeRecord } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
@@ -909,7 +1113,7 @@ State facts concisely using simple markdown list formats or blocks.
 /**
  * Explain endpoint: invokes Gemini to provide comprehensive research narratives on biological sequences.
  */
-app.post("/api/explain", async (req, res) => {
+app.post("/api/explain", requireUsageQuota, async (req, res) => {
   const { blockData, mode } = req.body;
 
   if (!blockData) {

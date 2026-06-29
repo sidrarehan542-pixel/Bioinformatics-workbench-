@@ -8,9 +8,23 @@
         "id": { "type": "string" },
         "email": { "type": "string" },
         "displayName": { "type": "string" },
-        "createdAt": { "type": "string" }
+        "createdAt": { "type": "string" },
+        "tier": { "type": "string" },
+        "stripeCustomerId": { "type": "string" },
+        "subscriptionId": { "type": "string" }
       },
-      "required": ["id", "email", "createdAt"]
+      "required": ["id", "email", "createdAt", "tier"]
+    },
+    "usageTracker": {
+      "title": "Usage Tracker",
+      "description": "Tracks API calls and usage",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "apiCalls": { "type": "integer" },
+        "lastReset": { "type": "string" }
+      },
+      "required": ["userId", "apiCalls", "lastReset"]
     },
     "pipeline": {
       "title": "Pipeline",
@@ -46,6 +60,10 @@
     "/users/{userId}": {
       "schema": "user",
       "description": "Individual user accounts"
+    },
+    "/users/{userId}/usage/tracker": {
+      "schema": "usageTracker",
+      "description": "User API usage limits tracking"
     },
     "/users/{userId}/pipelines/{pipelineId}": {
       "schema": "pipeline",

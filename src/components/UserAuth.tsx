@@ -22,17 +22,21 @@ import {
   Activity,
   Shield,
   CheckCircle,
-  AlertCircle
+  AlertCircle,
+  CreditCard,
+  Crown
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { UserProfile } from "../types";
 
 interface UserAuthProps {
   onUserChanged: (user: FirebaseUser | null) => void;
   savedPipelinesCount: number;
   queryHistoryCount: number;
+  userProfile?: UserProfile | null;
 }
 
-export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount }: UserAuthProps) {
+export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount, userProfile }: UserAuthProps) {
   const [currentUser, setCurrentUser] = useState<FirebaseUser | null>(null);
   const [showAuthModal, setShowAuthModal] = useState<boolean>(false);
   const [isRegister, setIsRegister] = useState<boolean>(false);
@@ -44,6 +48,7 @@ export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount
   const [errorText, setErrorText] = useState<string>("");
   const [successText, setSuccessText] = useState<string>("");
   const [showDropdown, setShowDropdown] = useState<boolean>(false);
+  const [checkoutLoading, setCheckoutLoading] = useState<boolean>(false);
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
@@ -52,6 +57,35 @@ export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount
     });
     return unsubscribe;
   }, [onUserChanged]);
+
+  const handleCheckout = async (tier: string) => {
+    if (!currentUser) return;
+    setCheckoutLoading(true);
+    try {
+      const res = await fetch("/api/create-checkout-session", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          tier,
+          userId: currentUser.uid,
+          userEmail: currentUser.email
+        })
+      });
+      const data = await res.json();
+      if (data.url) {
+        window.location.href = data.url;
+      } else {
+        throw new Error(data.error || "Failed to initiate checkout");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setErrorText("Payment gateway unavailable.");
+    } finally {
+      setCheckoutLoading(false);
+    }
+  };
 
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -88,7 +122,8 @@ export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount
           id: user.uid,
           email: user.email || email,
           displayName: displayName,
-          createdAt: new Date().toISOString()
+          createdAt: new Date().toISOString(),
+          tier: "free"
         });
 
         setSuccessText("Account registered successfully! Synchronizing workspace...");
@@ -182,16 +217,20 @@ export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount
                   >
                     {/* User info header */}
                     <div className="flex items-center gap-3 border-b border-slate-800 pb-3 mb-3">
-                      <div className="w-10 h-10 rounded-full bg-indigo-900 flex items-center justify-center text-sm font-bold text-indigo-300">
+                      <div className="w-10 h-10 rounded-full bg-indigo-900 flex items-center justify-center text-sm font-bold text-indigo-300 relative">
                         {getInitials(currentUser)}
+                        {userProfile?.tier === "pro" && <Crown className="absolute -top-1 -right-1 w-3.5 h-3.5 text-amber-400" />}
                       </div>
-                      <div className="flex flex-col min-w-0">
+                      <div className="flex flex-col min-w-0 flex-1">
                         <span className="font-bold text-slate-200 text-xs truncate">
                           {currentUser.displayName || "Biotech Member"}
                         </span>
                         <span className="text-[10px] text-slate-500 font-mono truncate">
                           {currentUser.email}
                         </span>
+                      </div>
+                      <div className="text-[9px] font-bold uppercase tracking-wider bg-slate-800 px-2 py-0.5 rounded text-slate-300 border border-slate-700">
+                        {userProfile?.tier || "FREE"}
                       </div>
                     </div>
 
@@ -219,6 +258,18 @@ export function UserAuth({ onUserChanged, savedPipelinesCount, queryHistoryCount
                         <span className="font-mono text-indigo-400">AES-256</span>
                       </div>
                     </div>
+
+                    {/* Subscription Action */}
+                    {userProfile?.tier !== "pro" && userProfile?.tier !== "enterprise" && (
+                      <button
+                        onClick={() => handleCheckout("pro")}
+                        disabled={checkoutLoading}
+                        className="w-full py-2 mb-2 bg-gradient-to-r from-amber-500/10 to-orange-500/10 hover:from-amber-500/20 hover:to-orange-500/20 border border-amber-500/30 text-amber-500 hover:text-amber-400 text-xs font-bold rounded-lg flex items-center justify-center gap-2 transition-all cursor-pointer"
+                      >
+                        {checkoutLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CreditCard className="w-3.5 h-3.5" />}
+                        Upgrade to Pro
+                      </button>
+                    )}
 
                     {/* Logout Button */}
                     <button

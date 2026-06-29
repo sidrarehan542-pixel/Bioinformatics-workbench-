@@ -33,7 +33,8 @@ import {
   Zap,
   ChevronDown,
   Thermometer,
-  Wrench
+  Wrench,
+  X
 } from "lucide-react";
 import {
   ResponsiveContainer,
@@ -229,6 +230,7 @@ export default function App() {
   const { alignSeqAsync, computePhysAsync, workerSupported } = useBioWorker();
 
   const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [userProfile, setUserProfile] = useState<any>(null);
 
   // Connection test on boot
   useEffect(() => {
@@ -238,6 +240,7 @@ export default function App() {
   // Listen to user and fetch records from Firestore
   useEffect(() => {
     if (!user) {
+      setUserProfile(null);
       // If user logs out, reset to the default preset state
       setSavedPipelines([
         {
@@ -263,6 +266,12 @@ export default function App() {
 
     const loadUserData = async () => {
       try {
+        // Fetch user profile
+        const userDoc = await getDocFromServer(doc(db, "users", user.uid));
+        if (userDoc.exists()) {
+          setUserProfile(userDoc.data());
+        }
+
         // Fetch saved pipelines
         const pipelinesSnap = await getDocs(collection(db, "users", user.uid, "pipelines"));
         const pipes = pipelinesSnap.docs.map(doc => doc.data() as SavedPipeline);
@@ -510,7 +519,14 @@ export default function App() {
 
     try {
       const url = `/api/query?db=${dbTerm}&id=${encodeURIComponent(queryTerm)}`;
-      const res = await fetch(url, { signal: controller.signal });
+      
+      let headers: Record<string, string> = {};
+      if (user) {
+        const token = await user.getIdToken();
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
+      const res = await fetch(url, { signal: controller.signal, headers });
       
       if (!res.ok) {
         const errJson = await res.json();
@@ -643,9 +659,15 @@ export default function App() {
 
     setGeminiLoading(true);
     try {
+      let headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (user) {
+        const token = await user.getIdToken();
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const res = await fetch("/api/explain", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ blockData: record, mode }),
         signal: controller.signal,
       });
@@ -964,6 +986,16 @@ export default function App() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
+  };
+
+  const [showProGateModal, setShowProGateModal] = useState<boolean>(false);
+
+  const requirePro = (callback: () => void) => {
+    if (!userProfile || (userProfile.tier !== "pro" && userProfile.tier !== "enterprise")) {
+      setShowProGateModal(true);
+      return;
+    }
+    callback();
   };
 
   // Advanced Export 1: Format 3D coordinate list into PDB-compliant model
@@ -1453,6 +1485,7 @@ export default function App() {
             onUserChanged={setUser}
             savedPipelinesCount={savedPipelines.length}
             queryHistoryCount={searchHistory.length}
+            userProfile={userProfile}
           />
         </div>
 
@@ -1900,12 +1933,12 @@ export default function App() {
 
                         {/* 2. Biophysical Residue profiling spreadsheet */}
                         <button
-                          onClick={handleDownloadResidueProfileCSV}
+                          onClick={() => requirePro(handleDownloadResidueProfileCSV)}
                           disabled={!activeRecord?.sequence}
                           className="w-full flex items-center justify-between p-1.5 rounded bg-slate-900/50 hover:bg-slate-900 text-[10px] text-slate-300 hover:text-white border border-slate-900 text-left disabled:opacity-40 transition-colors"
                         >
                           <span className="flex items-center gap-1.5">
-                            <Activity className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                            <Lock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
                             <span>Residues Biophysical Map (.CSV)</span>
                           </span>
                           <span className="text-[8px] bg-emerald-500/10 text-emerald-300 font-bold px-1.5 py-0.5 rounded border border-emerald-500/10 font-mono">Excel</span>
@@ -1913,12 +1946,12 @@ export default function App() {
 
                         {/* 3. Human codon optimized cDNA back-translation */}
                         <button
-                          onClick={handleDownloadBackTranslatedMRNA}
+                          onClick={() => requirePro(handleDownloadBackTranslatedMRNA)}
                           disabled={!activeRecord?.sequence}
                           className="w-full flex items-center justify-between p-1.5 rounded bg-slate-900/50 hover:bg-slate-900 text-[10px] text-slate-300 hover:text-white border border-slate-900 text-left disabled:opacity-40 transition-colors"
                         >
                           <span className="flex items-center gap-1.5">
-                            <Cpu className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                            <Lock className="w-3.5 h-3.5 text-amber-500 shrink-0" />
                             <span>Codon Optimized cDNA (.FASTA)</span>
                           </span>
                           <span className="text-[8px] bg-blue-500/10 text-blue-300 font-bold px-1.5 py-0.5 rounded border border-blue-500/10 font-mono">De-novo</span>
@@ -3256,6 +3289,59 @@ export default function App() {
         </aside>
 
       </main>
+
+      {/* Pro Tier Upgrade Modal */}
+      <AnimatePresence>
+        {showProGateModal && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowProGateModal(false)}
+              className="absolute inset-0 bg-slate-950/80 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ scale: 0.95, opacity: 0, y: 15 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.95, opacity: 0, y: 15 }}
+              className="relative w-full max-w-sm bg-slate-900 border border-amber-500/30 rounded-2xl shadow-2xl shadow-amber-500/10 overflow-hidden z-10 flex flex-col p-6"
+            >
+              <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-amber-400 to-orange-500"></div>
+              <button onClick={() => setShowProGateModal(false)} className="absolute top-4 right-4 text-slate-500 hover:text-slate-300">
+                <X className="w-5 h-5" />
+              </button>
+              
+              <div className="flex items-center justify-center w-12 h-12 rounded-full bg-amber-500/10 mb-4 mx-auto">
+                <Lock className="w-6 h-6 text-amber-500" />
+              </div>
+              
+              <h2 className="text-lg font-bold text-slate-100 text-center mb-2">Pro Feature Unlocked</h2>
+              <p className="text-xs text-slate-400 text-center leading-relaxed mb-6">
+                Advanced data exports and biophysical CSV mappings require a Pro or Enterprise subscription.
+              </p>
+              
+              {user ? (
+                <button
+                  onClick={() => setShowProGateModal(false) /* Should ideally route to UserAuth open state or have direct checkout */}
+                  className="w-full py-2.5 bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-400 hover:to-orange-400 text-white font-bold rounded-lg shadow-md transition-all text-sm mb-3"
+                >
+                  Manage Subscription
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    setShowProGateModal(false);
+                  }}
+                  className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-lg shadow-md transition-all text-sm mb-3"
+                >
+                  Login to Upgrade
+                </button>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* FOOTER: Global REST APIs Latency & GCP Status panel config */}
       <footer className="h-10 bg-slate-900 border-t border-slate-850 px-6 flex items-center justify-between shrink-0 select-none">

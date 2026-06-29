@@ -83,6 +83,24 @@ export interface SavedPipeline {
   alignmentConfig: AlignmentConfig;
 }
 
+export type UserTier = "free" | "pro" | "enterprise";
+
+export interface UserProfile {
+  id: string;
+  email: string;
+  displayName: string;
+  createdAt: string;
+  tier: UserTier;
+  stripeCustomerId?: string;
+  subscriptionId?: string;
+}
+
+export interface UsageTracker {
+  userId: string;
+  apiCalls: number;
+  lastReset: string;
+}
+
 export interface GeminiResponse {
   summary: string;
   structureNote: string;

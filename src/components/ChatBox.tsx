@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { MessageSquare, Send, Sparkles, RefreshCw, Bot, User, HelpCircle, X, ChevronDown, ChevronUp } from "lucide-react";
 import { ProteinData } from "../types";
+import { auth } from "../lib/firebase";
 
 interface Message {
   role: "user" | "ai";
@@ -89,9 +90,16 @@ export default function ChatBox({ activeRecord, isOpen = true, onClose }: ChatBo
         content: m.content
       }));
 
+      let headers: Record<string, string> = { "Content-Type": "application/json" };
+      const user = auth.currentUser;
+      if (user) {
+        const token = await user.getIdToken();
+        headers["Authorization"] = `Bearer ${token}`;
+      }
+
       const res = await fetch("/api/chat", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
           messages: apiMessages,
           activeRecord: activeRecord
